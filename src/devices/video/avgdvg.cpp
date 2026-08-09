@@ -32,6 +32,52 @@
 #define VGCLIP 1
 
 
+namespace {
+
+struct segment_interval
+{
+	double start;
+	double end;
+};
+
+segment_interval clipped_segment_interval(
+		int original_x0,
+		int original_y0,
+		int original_x1,
+		int original_y1,
+		int visible_x0,
+		int visible_y0,
+		int visible_x1,
+		int visible_y1)
+{
+	double start = 0.0;
+	double end = 1.0;
+	int const dx = original_x1 - original_x0;
+	int const dy = original_y1 - original_y0;
+	if ((std::abs(dx) >= std::abs(dy)) && dx)
+	{
+		start = double(visible_x0 - original_x0) / double(dx);
+		end = double(visible_x1 - original_x0) / double(dx);
+	}
+	else if (dy)
+	{
+		start = double(visible_y0 - original_y0) / double(dy);
+		end = double(visible_y1 - original_y0) / double(dy);
+	}
+
+	start = std::clamp(start, 0.0, 1.0);
+	return { start, std::clamp(end, start, 1.0) };
+}
+
+u64 segment_cycles_at_fraction(u64 duration, double fraction)
+{
+	double const position = double(duration) * std::clamp(fraction, 0.0, 1.0);
+	return std::min<u64>(std::llround(position), duration);
+}
+
+} // anonymous namespace
+
+
 /*************************************
  *
  *  Flipping
@@ -55,11 +101,27 @@ void avgdvg_device_base::apply_flipping(int &x, int &y) const
 
 void avgdvg_device_base::vg_flush()
 {
+	vg_finalize_pending_beam();
+
 	int cx0 = 0, cy0 = 0, cx1 = 0x5000000, cy1 = 0x5000000;
 	int i = 0;
+	u64 timeline_cursor = m_vector_buffer_start_time;
+	auto const advance_timeline = [this, &timeline_cursor] (u64 duration)
+	{
+		m_vector->advance_time(attotime::from_ticks(duration, MASTER_CLOCK));
+		timeline_cursor += duration;
+	};
 
-	while (m_vectbuf[i].status == VGCLIP)
+	while ((i < m_nvect) && (m_vectbuf[i].status == VGCLIP))
 		i++;
+	if (i == m_nvect)
+	{
+		if (m_state_time > timeline_cursor)
+			advance_timeline(m_state_time - timeline_cursor);
+		m_vector_buffer_start_time = std::max(m_state_time, timeline_cursor);
+		m_nvect = 0;
+		return;
+	}
 	int xs = m_vectbuf[i].x;
 	int ys = m_vectbuf[i].y;
 
@@ -67,15 +129,29 @@ void avgdvg_device_base::vg_flush()
 	{
 		if (m_vectbuf[i].status == VGVECTOR)
 		{
+			if (m_vectbuf[i].start_time > timeline_cursor)
+				advance_timeline(m_vectbuf[i].start_time - timeline_cursor);
+
 			int xe = m_vectbuf[i].x;
 			int ye = m_vectbuf[i].y;
 			int x0 = xs, y0 = ys, x1 = xe, y1 = ye;
+			int const original_x0 = x0;
+			int const original_y0 = y0;
+			int const original_x1 = x1;
+			int const original_y1 = y1;
+			u64 const ramp_duration = m_vectbuf[i].ramp_duration;
+			u64 const beam_on_duration = m_vectbuf[i].beam_on_duration;
 
 			xs = xe;
 			ys = ye;
 
 			if ((x0 < cx0 && x1 < cx0) || (x0 > cx1 && x1 > cx1))
+			{
+				// A rejected operation has no visible geometry, but still consumes
+				// its complete vector-generator duration.
+				advance_timeline(ramp_duration);
 				continue;
+			}
 
 			if (x0 < cx0)
 			{
@@ -99,7 +175,10 @@ void avgdvg_device_base::vg_flush()
 			}
 
 			if ((y0 < cy0 && y1 < cy0) || (y0 > cy1 && y1 > cy1))
+			{
+				advance_timeline(ramp_duration);
 				continue;
+			}
 
 			if (y0 < cy0)
 			{
@@ -122,8 +201,49 @@ void avgdvg_device_base::vg_flush()
 				y1 = cy1;
 			}
 
-			m_vector->add_point(x0, y0, m_vectbuf[i].color, 0);
-			m_vector->add_point(x1, y1, m_vectbuf[i].color, m_vectbuf[i].intensity);
+			segment_interval const visible = clipped_segment_interval(
+					original_x0,
+					original_y0,
+					original_x1,
+					original_y1,
+					x0,
+					y0,
+					x1,
+					y1);
+			u64 const visible_start = segment_cycles_at_fraction(ramp_duration, visible.start);
+			u64 const visible_end = segment_cycles_at_fraction(ramp_duration, visible.end);
+			bool const stationary =
+				(original_x0 == original_x1) &&
+				(original_y0 == original_y1);
+			u64 const visible_beam_on_duration = stationary
+				? beam_on_duration
+				: segment_cycles_at_fraction(beam_on_duration, visible.end) -
+					segment_cycles_at_fraction(beam_on_duration, visible.start);
+
+			// Partition, rather than duplicate, the original segment duration:
+			//
+			//   leading non-visible interval + visible traversal interval
+			//       + trailing non-visible interval = ramp_duration
+			//
+			// Advance non-visible time directly.  The zero-duration blank endpoint only
+			// establishes the visible start coordinate; it does not carry timing.
+			advance_timeline(visible_start);
+			m_vector->add_point(
+					x0,
+					y0,
+					m_vectbuf[i].color,
+					0,
+					attotime::zero,
+					attotime::zero);
+			m_vector->add_point(
+					x1,
+					y1,
+					m_vectbuf[i].color,
+					m_vectbuf[i].intensity,
+					attotime::from_ticks(visible_end - visible_start, MASTER_CLOCK),
+					attotime::from_ticks(visible_beam_on_duration, MASTER_CLOCK));
+			timeline_cursor += visible_end - visible_start;
+			advance_timeline(ramp_duration - visible_end);
 		}
 
 		if (m_vectbuf[i].status == VGCLIP)
@@ -140,11 +260,34 @@ void avgdvg_device_base::vg_flush()
 		}
 	}
 
+	if (m_state_time > timeline_cursor)
+		advance_timeline(m_state_time - timeline_cursor);
+	m_vector_buffer_start_time = std::max(m_state_time, timeline_cursor);
 	m_nvect = 0;
 }
 
-void avgdvg_device_base::vg_add_point_buf(int x, int y, rgb_t color, int intensity)
+void avgdvg_device_base::vg_finalize_pending_beam()
 {
+	if (m_pending_beam_vector < 0)
+		return;
+
+	vgvector &pending = m_vectbuf[m_pending_beam_vector];
+	int previous = m_pending_beam_vector - 1;
+	while ((previous >= 0) && (m_vectbuf[previous].status != VGVECTOR))
+		--previous;
+	bool const stationary =
+		(previous >= 0) &&
+		(m_vectbuf[previous].x == pending.x) &&
+		(m_vectbuf[previous].y == pending.y);
+	if ((pending.intensity > 0) && stationary)
+		pending.beam_on_duration = m_state_time - m_pending_beam_start;
+
+	m_pending_beam_vector = -1;
+}
+
+void avgdvg_device_base::vg_add_point_buf(int x, int y, rgb_t color, int intensity, u64 ramp_duration, bool beam_remains_on, u64 start_offset)
+{
+	vg_finalize_pending_beam();
 	if (m_nvect < MAXVECT)
 	{
 		m_vectbuf[m_nvect].status = VGVECTOR;
@@ -152,6 +295,16 @@ void avgdvg_device_base::vg_add_point_buf(int x, int y, rgb_t color, int intensi
 		m_vectbuf[m_nvect].y = y;
 		m_vectbuf[m_nvect].color = color;
 		m_vectbuf[m_nvect].intensity = intensity;
+		// Durations use MASTER_CLOCK ticks, matching the state-machine scheduler.
+		m_vectbuf[m_nvect].start_time = m_state_time + start_offset;
+		m_vectbuf[m_nvect].ramp_duration = ramp_duration;
+		m_vectbuf[m_nvect].beam_on_duration = ramp_duration;
+
+		if ((intensity > 0) && beam_remains_on)
+		{
+			m_pending_beam_vector = m_nvect;
+			m_pending_beam_start = m_vectbuf[m_nvect].start_time;
+		}
 		m_nvect++;
 	}
 }
@@ -217,16 +370,20 @@ int dvg_device::handler_1() // dvg_dmald
 	return 0;
 }
 
-void dvg_device::dvg_draw_to(int x, int y, int intensity)
+void dvg_device::dvg_draw_to(int x, int y, int intensity, u64 ramp_duration, u64 start_offset)
 {
 	apply_flipping(x, y);
 
-	if (!((x | y) & 0x400))
-		vg_add_point_buf(
-				(m_xmin + x - 512) << 16,
-				(m_ymin + 512 - y) << 16,
-				vector_device::color111(7),
-				pal4bit(intensity));
+	// Keep endpoints outside the DVG's valid counter range as blank operations.
+	// Dropping them would also drop their elapsed cycles from subsequent timing.
+	vg_add_point_buf(
+			(m_xmin + x - 512) << 16,
+			(m_ymin + 512 - y) << 16,
+			vector_device::color111(7),
+			((x | y) & 0x400) ? 0 : pal4bit(intensity),
+			ramp_duration,
+			false,
+			start_offset);
 }
 
 int dvg_device::handler_2() //dvg_gostrobe
@@ -260,9 +417,24 @@ int dvg_device::handler_2() //dvg_gostrobe
 
 	const int cycles = 8 * fin;
 	int c = 0;
+	int elapsed_cycles = 0;
+	int last_draw_cycles = 0;
+	// Hardware clipping can split one DVG ramp into multiple buffered operations.
+	// Give each emitted endpoint only the cycles since the previous split point.
+	auto const draw_to = [this, &elapsed_cycles, &last_draw_cycles] (int x, int y, int intensity)
+	{
+		dvg_draw_to(
+				x,
+				y,
+				intensity,
+				elapsed_cycles - last_draw_cycles,
+				last_draw_cycles);
+		last_draw_cycles = elapsed_cycles;
+	};
 
 	while (fin--)
 	{
+		elapsed_cycles += 8;
 		/*
 		 *  The 7497 Bit Rate Multiplier is a 6 bit counter with
 		 *  clever decoding of output bits to perform the following
@@ -307,9 +479,9 @@ int dvg_device::handler_2() //dvg_gostrobe
 			if (!(m_ypos & 0x400) && ((m_xpos ^ (m_xpos + dx)) & 0x400))
 			{
 				if ((m_xpos + dx) & 0x400)  // We are leaving the valid range
-					dvg_draw_to(m_xpos, m_ypos, m_intensity);
+					draw_to(m_xpos, m_ypos, m_intensity);
 				else                        // We are entering the valid range
-					dvg_draw_to((m_xpos + dx) & 0xfff, m_ypos, 0);
+					draw_to((m_xpos + dx) & 0xfff, m_ypos, 0);
 			}
 			m_xpos = (m_xpos + dx) & 0xfff;
 		}
@@ -321,16 +493,16 @@ int dvg_device::handler_2() //dvg_gostrobe
 				if (!(m_xpos & 0x400))
 				{
 					if ((m_ypos + dy) & 0x400)
-						dvg_draw_to(m_xpos, m_ypos, m_intensity);
+						draw_to(m_xpos, m_ypos, m_intensity);
 					else
-						dvg_draw_to(m_xpos, (m_ypos + dy) & 0xfff, 0);
+						draw_to(m_xpos, (m_ypos + dy) & 0xfff, 0);
 				}
 			}
 			m_ypos = (m_ypos + dy) & 0xfff;
 		}
 	}
 
-	dvg_draw_to(m_xpos, m_ypos, m_intensity);
+	draw_to(m_xpos, m_ypos, m_intensity);
 
 	return cycles;
 }
@@ -343,7 +515,7 @@ int dvg_device::handler_3() // dvg_haltstrobe
 	{
 		m_xpos = m_dvx & 0xfff;
 		m_ypos = m_dvy & 0xfff;
-		dvg_draw_to(m_xpos, m_ypos, 0);
+		dvg_draw_to(m_xpos, m_ypos, 0, 0);
 	}
 	return 0;
 }
@@ -643,7 +815,7 @@ int avg_device::avg_common_strobe3()
 		m_timer = 0;
 		m_xpos = m_xcenter;
 		m_ypos = m_ycenter;
-		vg_add_point_buf(m_xpos, m_ypos, 0, 0);
+		vg_add_point_buf(m_xpos, m_ypos, 0, 0, cycles);
 	}
 
 	return cycles;
@@ -664,7 +836,8 @@ int avg_device::handler_7() // avg_strobe3
 				x,
 				y,
 				vector_device::color111(m_color),
-				pal4bit(((m_int_latch >> 1) == 1) ? m_intensity : m_int_latch & 0xe));
+				pal4bit(((m_int_latch >> 1) == 1) ? m_intensity : m_int_latch & 0xe),
+				cycles);
 	}
 
 	return cycles;
@@ -715,7 +888,8 @@ int avg_tempest_device::handler_7() // tempest_strobe3
 				y - m_ycenter + m_xcenter,
 				x - m_xcenter + m_ycenter,
 				rgb_t(r, g, b),
-				pal4bit(((m_int_latch >> 1) == 1) ? m_intensity : m_int_latch & 0xe));
+				pal4bit(((m_int_latch >> 1) == 1) ? m_intensity : m_int_latch & 0xe),
+				cycles);
 	}
 
 	return cycles;
@@ -832,7 +1006,8 @@ int avg_mhavoc_device::handler_7()  // mhavoc_strobe3
 						x,
 						y,
 						rgb_t(r, g, b),
-						pal4bit(((m_int_latch >> 1) == 1) ? m_intensity : m_int_latch & 0xe));
+						pal4bit(((m_int_latch >> 1) == 1) ? m_intensity : m_int_latch & 0xe),
+						8);
 				m_spkl_shift = (BIT(m_spkl_shift, 6) ^ BIT(m_spkl_shift, 5) ^ 1) | (m_spkl_shift << 1);
 
 				if ((m_spkl_shift & 0x7f) == 0x7f)
@@ -861,7 +1036,8 @@ int avg_mhavoc_device::handler_7()  // mhavoc_strobe3
 					x,
 					y,
 					rgb_t(r, g, b),
-					pal4bit(((m_int_latch >> 1) == 1) ? m_intensity : m_int_latch & 0xe));
+					pal4bit(((m_int_latch >> 1) == 1) ? m_intensity : m_int_latch & 0xe),
+					cycles);
 		}
 	}
 
@@ -871,7 +1047,7 @@ int avg_mhavoc_device::handler_7()  // mhavoc_strobe3
 		m_timer = 0;
 		m_xpos = m_xcenter;
 		m_ypos = m_ycenter;
-		vg_add_point_buf(m_xpos, m_ypos, 0, 0);
+		vg_add_point_buf(m_xpos, m_ypos, 0, 0, cycles);
 	}
 
 	return cycles;
@@ -946,7 +1122,8 @@ int avg_starwars_device::handler_7() // starwars_strobe3
 				m_xpos,
 				m_ypos,
 				vector_device::color111(m_color),
-				intensity);
+				intensity,
+				cycles);
 	}
 
 	return cycles;
@@ -1099,7 +1276,8 @@ int avg_quantum_device::handler_7() // quantum_strobe3
 				y - m_ycenter + m_xcenter,
 				x - m_xcenter + m_ycenter,
 				rgb_t(r, g, b),
-				pal4bit((m_int_latch == 2) ? m_intensity : m_int_latch));
+				pal4bit((m_int_latch == 2) ? m_intensity : m_int_latch),
+				cycles);
 	}
 	if (OP2())
 	{
@@ -1107,7 +1285,7 @@ int avg_quantum_device::handler_7() // quantum_strobe3
 		m_timer = 0;
 		m_xpos = m_xcenter;
 		m_ypos = m_ycenter;
-		vg_add_point_buf(m_xpos, m_ypos, 0, 0);
+		vg_add_point_buf(m_xpos, m_ypos, 0, 0, cycles);
 	}
 
 	return cycles;
@@ -1180,7 +1358,8 @@ int avg_bzone_device::handler_7() // bzone_strobe3
 				m_xpos,
 				m_ypos,
 				vector_device::color111(7),
-				pal4bit(((m_int_latch >> 1) == 1) ? m_intensity : m_int_latch & 0xe));
+				pal4bit(((m_int_latch >> 1) == 1) ? m_intensity : m_int_latch & 0xe),
+				cycles);
 	}
 
 	return cycles;
@@ -1224,6 +1403,8 @@ TIMER_CALLBACK_MEMBER(avgdvg_device_base::run_state_machine)
 
 	while (cycles < VGSLICE)
 	{
+		int const initial_cycles = cycles;
+
 		// Get next state
 		m_state_latch = (m_state_latch & 0x10) | (m_prom[state_addr()] & 0xf);
 
@@ -1251,6 +1432,7 @@ TIMER_CALLBACK_MEMBER(avgdvg_device_base::run_state_machine)
 			m_vg_halt_timer->adjust(attotime::from_hz(MASTER_CLOCK) * cycles, 1);
 
 		m_state_latch = (m_halt << 4) | (m_state_latch & 0xf);
+		m_state_time += u64(std::max(cycles - initial_cycles, 0) + 8);
 		cycles += 8;
 	}
 
@@ -1341,9 +1523,20 @@ void avgdvg_device_base::device_start()
 	save_item(NAME(m_sync_halt));
 	save_item(NAME(m_xpos));
 	save_item(NAME(m_ypos));
+	save_item(NAME(m_state_time));
 
 	save_item(NAME(m_flip_x));
 	save_item(NAME(m_flip_y));
+}
+
+void avgdvg_device_base::device_post_load()
+{
+	// Buffered vectors are transient and are not part of save states. Discard
+	// their stale pre-load contents and restart timing at the restored clock.
+	m_nvect = 0;
+	m_vector_buffer_start_time = m_state_time;
+	m_pending_beam_start = m_state_time;
+	m_pending_beam_vector = -1;
 }
 
 void dvg_device::device_start()
@@ -1442,6 +1635,10 @@ avgdvg_device_base::avgdvg_device_base(const machine_config &mconfig, device_typ
 	m_memspace(*this, finder_base::DUMMY_TAG, -1),
 	m_membase(0),
 	m_nvect(0),
+	m_state_time(0),
+	m_vector_buffer_start_time(0),
+	m_pending_beam_start(0),
+	m_pending_beam_vector(-1),
 	m_pc(0),
 	m_sp(0),
 	m_dvx(0),

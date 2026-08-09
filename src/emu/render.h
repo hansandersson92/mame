@@ -113,6 +113,9 @@ constexpr u32 PRIMFLAG_TYPE_QUAD = 1 << PRIMFLAG_TYPE_SHIFT;
 constexpr int PRIMFLAG_PACKABLE_SHIFT = 21;
 constexpr u32 PRIMFLAG_PACKABLE = 1 << PRIMFLAG_PACKABLE_SHIFT;
 
+constexpr int PRIMFLAG_VECTOR_DOT_SHIFT = 22;
+constexpr u32 PRIMFLAG_VECTOR_DOT_MASK = 1 << PRIMFLAG_VECTOR_DOT_SHIFT;
+
 //**************************************************************************
 //  MACROS
 //**************************************************************************
@@ -143,6 +146,9 @@ constexpr u32 PRIMFLAG_GET_VECTOR(u32 x)    { return (x & PRIMFLAG_VECTOR_MASK) 
 
 constexpr u32 PRIMFLAG_VECTORBUF(u32 x)     { return x << PRIMFLAG_VECTORBUF_SHIFT; }
 constexpr u32 PRIMFLAG_GET_VECTORBUF(u32 x) { return (x & PRIMFLAG_VECTORBUF_MASK) >> PRIMFLAG_VECTORBUF_SHIFT; }
+
+constexpr u32 PRIMFLAG_VECTOR_DOT(u32 x)     { return x << PRIMFLAG_VECTOR_DOT_SHIFT; }
+constexpr u32 PRIMFLAG_GET_VECTOR_DOT(u32 x) { return (x & PRIMFLAG_VECTOR_DOT_MASK) >> PRIMFLAG_VECTOR_DOT_SHIFT; }
 
 
 //**************************************************************************
@@ -238,6 +244,10 @@ public:
 	render_color        color;              // RGBA values
 	u32                 flags = 0U;         // flags
 	float               width = 0.0F;       // width (for line primitives)
+	float               vector_start_time = -1.0F; // traversal start relative to the display list (seconds, negative if unavailable)
+	float               vector_ramp_duration = -1.0F; // X/Y deflection/traversal duration (seconds)
+	float               vector_beam_on_duration = -1.0F; // effective beam-current (Z-on) duration (seconds)
+	float               vector_total_duration = -1.0F; // complete display-list duration (seconds, negative if unavailable)
 	render_texinfo      texture;            // texture info (for quad primitives)
 	render_quad_texuv   texcoords;          // texture coordinates (for quad primitives)
 	render_container *  container = nullptr;// the render container we belong to
@@ -418,7 +428,7 @@ public:
 	void empty() { m_item_allocator.reclaim_all(m_itemlist); }
 
 	// add items to the list
-	void add_line(float x0, float y0, float x1, float y1, float width, rgb_t argb, u32 flags);
+	void add_line(float x0, float y0, float x1, float y1, float width, rgb_t argb, u32 flags, float vector_start_time = -1.0F, float vector_ramp_duration = -1.0F, float vector_beam_on_duration = -1.0F, float vector_total_duration = -1.0F);
 	void add_quad(float x0, float y0, float x1, float y1, rgb_t argb, render_texture *texture, u32 flags);
 	void add_char(float x0, float y0, float height, float aspect, rgb_t argb, render_font &font, u16 ch);
 	void add_point(float x0, float y0, float diameter, rgb_t argb, u32 flags) { add_line(x0, y0, x0, y0, diameter, argb, flags); }
@@ -438,7 +448,7 @@ private:
 		friend class simple_list<item>;
 
 	public:
-		item() : m_next(nullptr), m_type(0), m_flags(0), m_internal(0), m_width(0), m_texture(nullptr) { }
+		item() : m_next(nullptr), m_type(0), m_flags(0), m_internal(0), m_width(0), m_vector_start_time(-1), m_vector_ramp_duration(-1), m_vector_beam_on_duration(-1), m_vector_total_duration(-1), m_texture(nullptr) { }
 
 		// getters
 		item *next() const { return m_next; }
@@ -448,6 +458,10 @@ private:
 		u32 flags() const { return m_flags; }
 		u32 internal() const { return m_internal; }
 		float width() const { return m_width; }
+		float vector_start_time() const { return m_vector_start_time; }
+		float vector_ramp_duration() const { return m_vector_ramp_duration; }
+		float vector_beam_on_duration() const { return m_vector_beam_on_duration; }
+		float vector_total_duration() const { return m_vector_total_duration; }
 		render_texture *texture() const { return m_texture; }
 
 	private:
@@ -459,6 +473,10 @@ private:
 		u32                 m_flags;            // option flags
 		u32                 m_internal;         // internal flags
 		float               m_width;            // width of the line (lines only)
+		float               m_vector_start_time; // traversal start relative to the display list (seconds, negative if unavailable)
+		float               m_vector_ramp_duration; // X/Y deflection/traversal duration (seconds)
+		float               m_vector_beam_on_duration; // effective beam-current (Z-on) duration (seconds)
+		float               m_vector_total_duration; // complete display-list duration (seconds, negative if unavailable)
 		render_texture *    m_texture;          // pointer to the source texture (quads only)
 	};
 

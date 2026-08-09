@@ -2,8 +2,8 @@ $input v_texcoord0
 
 // license:BSD-3-Clause
 // copyright-holders:Hans Andersson
-// Attenuates the previous HDR phosphor buffer over time to simulate the
-// persistence and gradual decay of light emitted by a vector CRT phosphor.
+// Attenuates the previous HDR excitation buffer over time to simulate
+// persistent phosphor excitation between display-list updates.
 
 #include "common.sh"
 

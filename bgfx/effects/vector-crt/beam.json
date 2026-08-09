@@ -7,6 +7,7 @@
 	"fragment": "chains/vector-crt/fs_beam",
 	"uniforms": [
 		{ "name": "u_vector_params", "type": "vec4", "values": [ 0.016667, 0.080, 1.25, 0.14 ] },
-		{ "name": "u_target_dims", "type": "vec4", "values": [ 640.0, 480.0, 0.0015625, 0.0020833 ] }
+		{ "name": "u_target_dims", "type": "vec4", "values": [ 640.0, 480.0, 0.0015625, 0.0020833 ] },
+		{ "name": "u_vector_timing", "type": "vec4", "values": [ 0.016667, 1.0, 0.0, 0.0 ] }
 	]
 }

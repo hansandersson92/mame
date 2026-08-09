@@ -40,6 +40,9 @@ constexpr unsigned BLOOM_PASSES = 2;
 // This controls profile calibration; it is not a resolution-scaling factor.
 constexpr float BEAM_SIGMA_SCALE = 0.085f;
 
+constexpr double SQRT_TWO_PI = 2.5066282746310002;
+constexpr double TWO_PI = 6.2831853071795865;
+
 constexpr uint64_t TARGET_FLAGS =
 		BGFX_TEXTURE_RT |
 		BGFX_SAMPLER_U_CLAMP |
@@ -67,10 +70,10 @@ struct beam_instance
 	float green;
 	float blue;
 	float sigma;
-	float start;
-	float duration;
-	float intensity;
-	float unused;
+	float start;             // display-list-normalized traversal start
+	float ramp_duration;     // display-list-normalized X/Y traversal duration
+	float intensity;         // normalized vector-generator Z level
+	float beam_on_duration;  // display-list-normalized Z-on exposure duration
 };
 
 static_assert(sizeof(beam_instance) == sizeof(float) * 12);
@@ -300,59 +303,307 @@ void bgfx_vector_renderer::draw_beams(uint16_t view, double frame_time)
 	if (m_vectors.empty())
 		return;
 
+	bool const have_timing = std::all_of(
+			m_vectors.begin(),
+			m_vectors.end(),
+			[] (render_primitive const *primitive)
+			{
+				return
+						(primitive->vector_start_time >= 0.0F) &&
+						(primitive->vector_ramp_duration >= 0.0F) &&
+						(primitive->vector_beam_on_duration >= 0.0F) &&
+						(primitive->vector_total_duration > 0.0F);
+			});
+
+	double const total_duration =
+			have_timing
+					? m_vectors.front()->vector_total_duration
+					: 0.0;
+	double const scan_duration =
+			have_timing
+					? total_duration
+					: frame_time;
+
 	double total_length = 0.0;
+
+#ifdef VECTOR_CRT_LOG_ENERGY_RATE
+	double integrated_response = 0.0;
+	double timed_beam_energy = 0.0;
+#endif
+
 	for (render_primitive const *const primitive : m_vectors)
 	{
-		double const dx = primitive->bounds.x1 - primitive->bounds.x0;
-		double const dy = primitive->bounds.y1 - primitive->bounds.y0;
-		total_length += std::max(std::sqrt((dx * dx) + (dy * dy)), std::max<double>(primitive->width, 1.0));
-	}
-	total_length = std::max(total_length, std::numeric_limits<double>::epsilon());
+		double const dx =
+				primitive->bounds.x1 -
+				primitive->bounds.x0;
 
-	set_uniform(m_beam_effect, "u_vector_params", float(frame_time), m_persistence, m_beam_intensity, m_halo);
-	set_uniform(m_beam_effect, "u_target_dims", float(m_width), float(m_height), 1.0f / float(m_width), 1.0f / float(m_height));
+		double const dy =
+				primitive->bounds.y1 -
+				primitive->bounds.y0;
+
+		double const beam_length =
+				std::sqrt((dx * dx) + (dy * dy));
+
+		total_length +=
+				std::max(
+						beam_length,
+						std::max<double>(
+								primitive->width,
+								1.0));
+
+#ifdef VECTOR_CRT_LOG_ENERGY_RATE
+		double const sigma =
+				std::max(
+						double(primitive->width) *
+								m_beam_width *
+								BEAM_SIGMA_SCALE,
+						0.01);
+
+		double const intensity =
+				std::max<double>(
+						primitive->color.a,
+						0.0);
+
+		double const core_sigma = sigma;
+		double const halo_sigma = sigma * 3.5;
+		double const halo_strength = m_halo;
+
+		double const spatial_integral =
+				SQRT_TWO_PI *
+						((core_sigma +
+						  (halo_strength * halo_sigma)) *
+						 beam_length) +
+				TWO_PI *
+						((core_sigma * core_sigma) +
+						 (halo_strength *
+						  halo_sigma *
+						  halo_sigma));
+
+		integrated_response +=
+				intensity *
+				spatial_integral;
+
+		if (have_timing)
+		{
+			timed_beam_energy +=
+					intensity *
+					primitive->vector_beam_on_duration;
+		}
+#endif
+	}
+
+	total_length =
+			std::max(
+					total_length,
+					std::numeric_limits<double>::epsilon());
+
+	/*
+	 * Convert the physical beam-time response to the pixel-space
+	 * Gaussian integral used by the shader.  The integral scales
+	 * with pixel area, hence the square of vertical resolution.
+	 */
+	constexpr double BEAM_ENERGY_RATE_1080 = 1.58e6;
+
+	double const resolution_scale =
+			double(m_height) / 1080.0;
+
+	double const energy_rate =
+			BEAM_ENERGY_RATE_1080 *
+			resolution_scale *
+			resolution_scale;
+
+#ifdef VECTOR_CRT_LOG_ENERGY_RATE
+	bool const calibration_valid =
+			have_timing &&
+			(timed_beam_energy >
+					std::numeric_limits<double>::epsilon()) &&
+			(integrated_response >
+					std::numeric_limits<double>::epsilon());
+
+	if (calibration_valid)
+	{
+		double const measured_energy_rate =
+				integrated_response /
+				timed_beam_energy;
+
+		static unsigned log_counter = 0;
+
+		if (!(log_counter++ % 60))
+		{
+			osd_printf_verbose(
+					"Vector CRT: "
+					"measured_rate=%g fixed_rate=%g "
+					"ratio=%g duration=%g "
+					"spatial=%g timed_energy=%g "
+					"target=%ux%u\n",
+					measured_energy_rate,
+					energy_rate,
+					measured_energy_rate / energy_rate,
+					total_duration,
+					integrated_response,
+					timed_beam_energy,
+					m_width,
+					m_height);
+		}
+	}
+#endif
+
+	set_uniform(
+			m_beam_effect,
+			"u_vector_params",
+			float(frame_time),
+			m_persistence,
+			m_beam_intensity,
+			m_halo);
+
+	set_uniform(
+			m_beam_effect,
+			"u_target_dims",
+			float(m_width),
+			float(m_height),
+			1.0f / float(m_width),
+			1.0f / float(m_height));
+
+	set_uniform(
+			m_beam_effect,
+			"u_vector_timing",
+			float(scan_duration),
+			float(energy_rate),
+			have_timing ? 1.0F : 0.0F,
+			0.0F);
 
 	uint32_t offset = 0;
 	double elapsed_length = 0.0;
+
 	while (offset < m_vectors.size())
 	{
-		uint32_t const remaining = uint32_t(m_vectors.size() - offset);
-		uint32_t const count = bgfx::getAvailInstanceDataBuffer(remaining, sizeof(beam_instance));
+		uint32_t const remaining =
+				uint32_t(m_vectors.size() - offset);
+
+		uint32_t const count =
+				bgfx::getAvailInstanceDataBuffer(
+						remaining,
+						sizeof(beam_instance));
+
 		if (!count)
 		{
-			osd_printf_warning("BGFX: Transient instance buffer exhausted while rendering vectors\n");
+			osd_printf_warning(
+					"BGFX: Transient instance buffer exhausted "
+					"while rendering vectors\n");
 			break;
 		}
 
 		bgfx::InstanceDataBuffer instances;
-		bgfx::allocInstanceDataBuffer(&instances, count, sizeof(beam_instance));
-		beam_instance *const data = reinterpret_cast<beam_instance *>(instances.data);
+
+		bgfx::allocInstanceDataBuffer(
+				&instances,
+				count,
+				sizeof(beam_instance));
+
+		beam_instance *const data =
+				reinterpret_cast<beam_instance *>(
+						instances.data);
+
 		for (uint32_t index = 0; index < count; ++index)
 		{
-			render_primitive const &primitive = *m_vectors[offset + index];
-			double const dx = primitive.bounds.x1 - primitive.bounds.x0;
-			double const dy = primitive.bounds.y1 - primitive.bounds.y0;
-			double const length = std::max(std::sqrt((dx * dx) + (dy * dy)), std::max<double>(primitive.width, 1.0));
+			render_primitive const &primitive =
+					*m_vectors[offset + index];
 
-			beam_instance &instance = data[index];
+			double const dx =
+					primitive.bounds.x1 -
+					primitive.bounds.x0;
+
+			double const dy =
+					primitive.bounds.y1 -
+					primitive.bounds.y0;
+
+			double const beam_length =
+					std::sqrt((dx * dx) + (dy * dy));
+
+			double const fallback_length =
+					std::max(
+							beam_length,
+							std::max<double>(
+									primitive.width,
+									1.0));
+
+			beam_instance &instance =
+					data[index];
+
 			instance.x0 = primitive.bounds.x0;
 			instance.y0 = primitive.bounds.y0;
 			instance.x1 = primitive.bounds.x1;
 			instance.y1 = primitive.bounds.y1;
+
 			instance.red = primitive.color.r;
 			instance.green = primitive.color.g;
 			instance.blue = primitive.color.b;
-			instance.sigma = primitive.width * m_beam_width * BEAM_SIGMA_SCALE;
-			instance.start = float(elapsed_length / total_length);
-			instance.duration = float(length / total_length);
-			instance.intensity = primitive.color.a;
-			instance.unused = 0.0f;
-			elapsed_length += length;
+
+			instance.sigma =
+					primitive.width *
+					m_beam_width *
+					BEAM_SIGMA_SCALE;
+
+			instance.start =
+					have_timing
+							? float(
+									double(primitive.vector_start_time) /
+									total_duration)
+							: float(
+									elapsed_length /
+									total_length);
+
+			instance.ramp_duration =
+					have_timing
+							? float(
+									double(primitive.vector_ramp_duration) /
+									total_duration)
+							: float(
+									fallback_length /
+									total_length);
+
+			instance.intensity =
+					primitive.color.a;
+#ifdef VECTOR_CRT_LOG_DOTS
+			if (PRIMFLAG_GET_VECTOR_DOT(primitive.flags))
+			{
+				osd_printf_verbose(
+						"Vector CRT dot: "
+						"duration=%g total=%g intensity=%g "
+						"start=%g pos=(%g,%g)\n",
+						double(primitive.vector_ramp_duration),
+						double(primitive.vector_total_duration),
+						double(primitive.color.a),
+						double(primitive.vector_start_time),
+						double(primitive.bounds.x0),
+						double(primitive.bounds.y0));
+			}
+#endif
+			instance.beam_on_duration =
+					have_timing
+							? float(
+									double(primitive.vector_beam_on_duration) /
+									total_duration)
+							: instance.ramp_duration;
+
+			if (!have_timing)
+			{
+				elapsed_length +=
+						fallback_length;
+			}
 		}
 
-		bgfx::setVertexBuffer(0, m_beam_vertices);
-		bgfx::setInstanceDataBuffer(&instances, 0, count);
+		bgfx::setVertexBuffer(
+				0,
+				m_beam_vertices);
+
+		bgfx::setInstanceDataBuffer(
+				&instances,
+				0,
+				count);
+
 		m_beam_effect->submit(view);
+
 		offset += count;
 	}
 }
@@ -384,7 +635,7 @@ void bgfx_vector_renderer::prepare(uint32_t &view, render_primitive *first, uint
 		frame_time = emu_time - m_last_emu_time;
 
 		// Time can move backwards after a reset, state load, rewind, or
-		// machine restart. Clear the phosphor instead of retaining an image
+		// machine restart. Clear accumulated excitation instead of retaining an image
 		// from the previous timeline.
 		if (frame_time < 0.0)
 		{
@@ -421,9 +672,9 @@ void bgfx_vector_renderer::prepare(uint32_t &view, render_primitive *first, uint
 	}
 	else
 	{
-		// Exponential phosphor decay:
+		// Exponential excitation decay:
 		//
-		//     I(t + dt) = I(t) * exp(-dt / tau)
+		//     E(t + dt) = E(t) * exp(-dt / tau)
 		//
 		// m_persistence is tau in seconds.
 		float const tau = std::max(m_persistence, 0.001f);

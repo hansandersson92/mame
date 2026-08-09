@@ -41,6 +41,9 @@ protected:
 		int x; int y;
 		rgb_t color;
 		int intensity;
+		u64 start_time;       // operation start time in MASTER_CLOCK ticks
+		u64 ramp_duration;    // X/Y deflection traversal time in MASTER_CLOCK ticks
+		u64 beam_on_duration; // effective Z-on exposure time in MASTER_CLOCK ticks
 		int arg1; int arg2;
 		int status;
 	};
@@ -48,6 +51,7 @@ protected:
 	avgdvg_device_base(const machine_config &mconfig, device_type type, const char *tag, device_t *owner, u32 clock);
 
 	virtual void device_start() override ATTR_COLD;
+	virtual void device_post_load() override;
 
 	virtual int handler_0() = 0;
 	virtual int handler_1() = 0;
@@ -73,7 +77,8 @@ protected:
 	void vg_set_halt(int dummy);
 
 	void vg_flush();
-	void vg_add_point_buf(int x, int y, rgb_t color, int intensity);
+	void vg_finalize_pending_beam();
+	void vg_add_point_buf(int x, int y, rgb_t color, int intensity, u64 ramp_duration, bool beam_remains_on = true, u64 start_offset = 0);
 	void vg_add_clip(int xmin, int ymin, int xmax, int ymax);
 
 	required_device<vector_device> m_vector;
@@ -85,6 +90,10 @@ protected:
 
 	int m_nvect;
 	vgvector m_vectbuf[MAXVECT];
+	u64 m_state_time;
+	u64 m_vector_buffer_start_time;
+	u64 m_pending_beam_start;
+	int m_pending_beam_vector;
 
 	u16 m_pc;
 	u8 m_sp;
@@ -137,7 +146,7 @@ protected:
 	virtual void vgrst() override;
 
 private:
-	void dvg_draw_to(int x, int y, int intensity);
+	void dvg_draw_to(int x, int y, int intensity, u64 ramp_duration, u64 start_offset = 0);
 };
 
 

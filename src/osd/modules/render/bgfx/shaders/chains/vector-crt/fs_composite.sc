@@ -2,10 +2,11 @@ $input v_texcoord0
 
 // license:BSD-3-Clause
 // copyright-holders:Hans Andersson
-// Combines persistent phosphor and bloom, then applies exposure, luminance
+// Combines persistent excitation and emitted-light bloom, then applies exposure, luminance
 // tone mapping, gamma correction, and optional edge vignetting for display.
 
 #include "common.sh"
+#include "phosphor_emission.sh"
 
 SAMPLER2D(s_accum, 0);
 SAMPLER2D(s_bloom, 1);
@@ -13,9 +14,8 @@ uniform vec4 u_composite;
 
 void main()
 {
-	vec3 phosphor = max(
-			texture2D(s_accum, v_texcoord0).rgb,
-			vec3_splat(0.0));
+	vec3 phosphor = phosphor_emission(
+			texture2D(s_accum, v_texcoord0).rgb);
 
 	vec3 bloom = max(
 			texture2D(s_bloom, v_texcoord0).rgb,

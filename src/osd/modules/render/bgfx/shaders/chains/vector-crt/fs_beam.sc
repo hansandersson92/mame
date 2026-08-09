@@ -2,19 +2,42 @@ $input v_beam, v_beam_color, v_beam_timing
 
 // license:BSD-3-Clause
 // copyright-holders:Hans Andersson
-// Rasterizes each vector as an HDR Gaussian beam, including intensity-dependent
-// core/halo width and scan-order timing, into the phosphor accumulation buffer.
+// Rasterizes each vector as an HDR Gaussian core and halo with scan-order timing
+// into the excitation accumulation buffer. With generator timing, intensity
+// controls deposited energy rather than the spatial profile; untimed generators
+// retain the legacy intensity-shaped profile for compatibility.
 
 #include "common.sh"
+#include "beam_profile.sh"
+
+#define SQRT_TWO_PI                 2.50662827463
+#define TWO_PI                      6.28318530718
+
+#define MIN_SPATIAL_INTEGRAL        0.000001
+#define MIN_PERSISTENCE             0.001
+#define SEGMENT_EPSILON             0.0001
+
+#define SCAN_PERSISTENCE_FRAMES     10.0
 
 // x = frame interval (seconds), y = phosphor persistence (seconds),
 // z = beam-energy gain, w = halo strength.
 uniform vec4 u_vector_params;
 uniform vec4 u_target_dims;
+// x = complete display-list duration (seconds), y = calibrated beam-energy rate,
+// z = duration-energy enable, w = unused.
+uniform vec4 u_vector_timing;
 
-// Integrate the core and halo over the approximate pixel footprint. Adding
-// the box-filter variance to the Gaussian variance prevents subpixel beams
-// from aliasing; scaling by sigma/filteredSigma preserves integrated energy.
+// The integral of a Gaussian distance field around a finite segment is the
+// sum of its swept-line body and two half-Gaussian endpoint caps. Comparing
+// this integral before and after approximate pixel filtering lets the widened
+// response preserve energy continuously from stationary dots to long beams.
+float capsule_integral(float sigma, float beamLength)
+{
+	return
+		SQRT_TWO_PI * sigma * beamLength +
+		TWO_PI * sigma * sigma;
+}
+
 float beam_response_filtered(float along, float across, float beamLength, float coreSigma, float haloSigma, float haloStrength)
 {
 	// Outside either endpoint, include longitudinal distance to produce round
@@ -24,8 +47,15 @@ float beam_response_filtered(float along, float across, float beamLength, float 
 	float pixelVariance = pixelAcross * pixelAcross / 12.0;
 	float filteredCoreSigma = sqrt(coreSigma * coreSigma + pixelVariance);
 	float filteredHaloSigma = sqrt(haloSigma * haloSigma + pixelVariance);
-	float coreScale = coreSigma / filteredCoreSigma;
-	float haloScale = haloSigma / filteredHaloSigma;
+	// Preserve the complete capsule integral continuously for every segment
+	// length. This approaches one-dimensional sigma compensation for a long
+	// beam and two-dimensional squared compensation for a stationary spot.
+	float coreScale =
+		capsule_integral(coreSigma, beamLength) /
+		capsule_integral(filteredCoreSigma, beamLength);
+	float haloScale =
+		capsule_integral(haloSigma, beamLength) /
+		capsule_integral(filteredHaloSigma, beamLength);
 	float distanceSquared = across * across + pastEndpoint * pastEndpoint;
 
 	return
@@ -40,48 +70,82 @@ void main()
 	float beamLength = v_beam.z;
 
 	float intensity = max(v_beam_color.a, 0.0);
-	float intensityResponse = sqrt(clamp(intensity, 0.0, 1.0));
+	float timingEnabled = clamp(u_vector_timing.z, 0.0, 1.0);
 
-	// Brighter vectors get a slightly wider core and a somewhat wider halo.
-	// Keep the response conservative so bright text does not become swollen.
-	float baseSigma = max(v_beam.w, 0.01);
-	float coreSigma = baseSigma * mix(1.0, 1.12, intensityResponse);
-	float haloSigma = baseSigma * 3.5 * mix(1.0, 1.25, intensityResponse);
+	float baseSigma = max(v_beam.w, BEAM_MIN_SIGMA);
 
-	float haloStrength =
-		u_vector_params.w * mix(0.6, 1.0, intensityResponse);
+	float coreSigma = beam_core_sigma(baseSigma, intensity, timingEnabled);
+	float haloSigma = beam_halo_sigma(baseSigma, intensity, timingEnabled);
+	float haloStrength = beam_halo_strength(
+		u_vector_params.w,
+		intensity,
+		timingEnabled);
 
-	// Widen each Gaussian to account for the pixel's width across the beam.
-	// Reduce its peak by the same ratio so the total beam energy stays constant.
 	float radial = beam_response_filtered(
-		along, across, beamLength, coreSigma, haloSigma, haloStrength);
+		along,
+		across,
+		beamLength,
+		coreSigma,
+		haloSigma,
+		haloStrength);
 
-	// The quad includes padded caps, so clamp the beam-local coordinate to the
-	// physical segment. Put a degenerate segment at its temporal midpoint.
+	float spatialIntegral =
+		SQRT_TWO_PI *
+			(coreSigma + haloStrength * haloSigma) *
+			beamLength +
+		TWO_PI *
+			(coreSigma * coreSigma +
+			 haloStrength * haloSigma * haloSigma);
+
+	float durationSeconds =
+		max(v_beam_timing.w, 0.0) *
+		max(u_vector_timing.x, 0.0);
+
+	float durationResponse =
+		durationSeconds *
+		u_vector_timing.y /
+		max(spatialIntegral, MIN_SPATIAL_INTEGRAL);
+
+	float energyResponse =
+		mix(
+			1.0,
+			durationResponse,
+			timingEnabled);
+
 	float segmentPosition =
-		beamLength > 0.0001
+		beamLength > SEGMENT_EPSILON
 			? clamp(along / beamLength, 0.0, 1.0)
 			: 0.5;
 
-	// v_beam_timing.xy is the segment's start and duration as fractions of the
-	// complete display-list scan. Convert the fragment's arrival time into its
-	// age, in seconds, at the end of the current frame interval.
 	float arrival = clamp(
-		v_beam_timing.x + v_beam_timing.y * segmentPosition,
+		v_beam_timing.x +
+		v_beam_timing.y * segmentPosition,
 		0.0,
 		1.0);
 
-	float age = max(u_vector_params.x * (1.0 - arrival), 0.0);
+	float age =
+		max(
+			u_vector_timing.x *
+			(1.0 - arrival),
+			0.0);
 
-	// Use the physical phosphor persistence when it is long enough. The ten-frame
-	// floor prevents short persistence settings from erasing vectors drawn early
-	// in this frame; inter-frame decay still uses the unmodified persistence.
-	float scanPersistence = max(u_vector_params.y, u_vector_params.x * 10.0);
-	float temporal = exp(-age / max(scanPersistence, 0.001));
+	float scanPersistence =
+		max(
+			u_vector_params.y,
+			u_vector_params.x *
+			SCAN_PERSISTENCE_FRAMES);
+
+	float temporal =
+		exp(
+			-age /
+			max(
+				scanPersistence,
+				MIN_PERSISTENCE));
 
 	vec3 energy =
 		v_beam_color.rgb *
 		intensity *
+		energyResponse *
 		radial *
 		temporal *
 		u_vector_params.z;

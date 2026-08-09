@@ -54,6 +54,7 @@ vector_device::vector_device(const machine_config &mconfig, const char *tag, dev
 		device_video_output_interface(mconfig, *this),
 		m_vector_list(nullptr),
 		m_vector_index(0),
+		m_vector_time(attotime::zero),
 		m_min_intensity(255),
 		m_max_intensity(0),
 		m_visarea(rectangle()),
@@ -165,15 +166,41 @@ float vector_device::normalized_sigmoid(float n, float k)
 	return (n - n * k) / (k - fabs(n) * 2.0f * k + 1.0f);
 }
 
+#define VECTOR_TIMING_REGRESSION_TEST 0
 
 //-------------------------------------------------
-// Adds a line end point to the vertices list. The vector processor emulation
-// needs to call this.
+// Adds a timed line endpoint to the vector list. The display-list cursor is
+// advanced by the X/Y ramp only. beam_on_duration describes exposure and does
+// not independently advance time because it can overlap ramp or other
+// generator activity. Callers must use advance_time for every non-ramp
+// interval before submitting the next operation or completing the list.
 //-------------------------------------------------
 
-void vector_device::add_point(int x, int y, rgb_t color, int intensity)
+void vector_device::add_point(int x, int y, rgb_t color, int intensity, attotime ramp_duration, attotime beam_on_duration)
 {
+#ifdef VECTOR_TIMING_REGRESSION_TEST
+ramp_duration = attotime::never;
+beam_on_duration = attotime::never;
+#endif
 	point *newpoint;
+	ramp_duration = ramp_duration.is_never()
+		? attotime::never
+		: std::max(ramp_duration, attotime::zero);
+	beam_on_duration = beam_on_duration.is_never()
+		? attotime::never
+		: std::max(beam_on_duration, attotime::zero);
+
+	attotime start_time = attotime::never;
+	if (!m_vector_time.is_never())
+	{
+		if (ramp_duration.is_never())
+			m_vector_time = attotime::never;
+		else
+		{
+			start_time = m_vector_time;
+			m_vector_time += ramp_duration;
+		}
+	}
 
 	intensity = std::clamp(intensity, 0, 255);
 
@@ -194,6 +221,9 @@ void vector_device::add_point(int x, int y, rgb_t color, int intensity)
 	newpoint->y = y;
 	newpoint->col = color;
 	newpoint->intensity = intensity;
+	newpoint->start_time = start_time;
+	newpoint->ramp_duration = ramp_duration;
+	newpoint->beam_on_duration = beam_on_duration;
 
 	m_vector_index++;
 	if (m_vector_index >= MAX_POINTS)
@@ -205,6 +235,22 @@ void vector_device::add_point(int x, int y, rgb_t color, int intensity)
 
 
 //-------------------------------------------------
+// Advance the complete display-list timeline without adding an X/Y ramp.
+// This includes fetch/state-machine gaps and any remainder of a Z-on dwell
+// after its associated ramp. The duration may overlap beam exposure, so this
+// function does not imply that the beam is blanked.
+//-------------------------------------------------
+
+void vector_device::advance_time(attotime duration)
+{
+#ifdef VECTOR_TIMING_REGRESSION_TEST
+	return;
+#endif
+	m_vector_time += duration;
+}
+
+
+//-------------------------------------------------
 // The vector CPU creates a new display list. We save the old display list,
 // but only once per refresh.
 //-------------------------------------------------
@@ -212,6 +258,7 @@ void vector_device::add_point(int x, int y, rgb_t color, int intensity)
 void vector_device::clear_list()
 {
 	m_vector_index = 0;
+	m_vector_time = attotime::zero;
 }
 
 //-------------------------------------------------
@@ -222,6 +269,9 @@ bool vector_device::video_output_update()
 {
 	if (!m_vector_update.isnull())
 		m_vector_update(*this);
+
+	auto const seconds = [] (attotime duration) { return duration.is_never() ? -1.0F : float(duration.as_double()); };
+	float const total_duration = seconds(m_vector_time);
 
 	uint32_t flags = PRIMFLAG_ANTIALIAS(1) | PRIMFLAG_BLENDMODE(BLENDMODE_ADD) | PRIMFLAG_VECTOR(1);
 	const rectangle &visarea = m_visarea;
@@ -242,9 +292,14 @@ bool vector_device::video_output_update()
 	for (int i = 0; i < m_vector_index; i++)
 	{
 		render_bounds coords;
+		float const point_start = seconds(curpoint->start_time);
+		float const ramp_duration = seconds(curpoint->ramp_duration);
+		float const beam_on_duration = seconds(curpoint->beam_on_duration);
 
 		float intensity = (float)curpoint->intensity / 255.0f;
 		float intensity_weight = normalized_sigmoid(intensity, vector_options::s_beam_intensity_weight);
+
+		bool const is_dot = (m_prevpoint.x == curpoint->x) && (m_prevpoint.y == curpoint->y);
 
 		// check for static intensity
 		float beam_width = m_min_intensity == m_max_intensity
@@ -255,7 +310,7 @@ bool vector_device::video_output_update()
 		beam_width *= 1.0f / (float)VECTOR_WIDTH_DENOM;
 
 		// apply point scale for points
-		if (m_prevpoint.x == curpoint->x && m_prevpoint.y == curpoint->y)
+		if (is_dot)
 			beam_width *= vector_options::s_beam_dot_size;
 
 		coords.x0 = (float(m_prevpoint.x) - xoffs) * xscale;
@@ -269,7 +324,11 @@ bool vector_device::video_output_update()
 					coords.x0, coords.y0, coords.x1, coords.y1,
 					beam_width,
 					(curpoint->intensity << 24) | (curpoint->col & 0xffffff),
-					flags);
+					flags | PRIMFLAG_VECTOR_DOT(is_dot ? 1 : 0),
+					point_start,
+					ramp_duration,
+					beam_on_duration,
+					total_duration);
 			m_line_notifier(m_prevpoint.x, m_prevpoint.y, curpoint->x, curpoint->y, curpoint->col, curpoint->intensity, visarea.width(), visarea.height());
 		}
 		else

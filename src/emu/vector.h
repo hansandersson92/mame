@@ -56,7 +56,8 @@ public:
 	std::pair<unsigned, unsigned> physical_aspect() const override;
 
 	void clear_list();
-	void add_point(int x, int y, rgb_t color, int intensity);
+	void add_point(int x, int y, rgb_t color, int intensity, attotime ramp_duration = attotime::never, attotime beam_on_duration = attotime::never);
+	void advance_time(attotime duration);
 
 	// configuration
 	template <typename T> vector_device &set_refresh_hz(T &&hz) { m_frame_period = attotime::from_hz(hz); return *this; }
@@ -110,16 +111,21 @@ private:
 	/* The vertices are buffered here */
 	struct point
 	{
-		point() : x(0), y(0), col(0), intensity(0) { }
+		point() : x(0), y(0), col(0), intensity(0), start_time(attotime::never), ramp_duration(attotime::never), beam_on_duration(attotime::never) { }
 
 		int x; int y;
 		rgb_t col;
-		int intensity;
+		int intensity;                 // vector-generator Z level, normalized downstream
+		attotime start_time;           // X/Y traversal start time in the display list
+		attotime ramp_duration;        // X/Y deflection time from the preceding point
+		attotime beam_on_duration;     // time for which beam current is present
 	};
 
 	std::unique_ptr<point[]> m_vector_list;
 	struct point m_prevpoint;
 	int m_vector_index;
+	// Current elapsed time in the generated vector display list.
+	attotime m_vector_time;
 	int m_min_intensity;
 	int m_max_intensity;
 

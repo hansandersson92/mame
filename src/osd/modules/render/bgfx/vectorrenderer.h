@@ -37,12 +37,12 @@ public:
 	bgfx_vector_renderer(bgfx_vector_renderer const &) = delete;
 	bgfx_vector_renderer &operator=(bgfx_vector_renderer const &) = delete;
 
-	// Submit decay, beam deposition, and bloom passes.  The view is advanced
-	// for every submitted pass.  Emulated time is used so paused emulation does
-	// not repeatedly excite the phosphor with the same display list.
+	// Submit excitation decay, beam deposition, and bloom passes.  The view is
+	// advanced for every submitted pass.  Emulated time is used so paused
+	// emulation does not deposit the same display list repeatedly.
 	void prepare(uint32_t &view, render_primitive *first, uint16_t width, uint16_t height, double emu_time);
 
-	// Composite the current HDR phosphor image into an already configured view.
+	// Composite the current HDR excitation and bloom into an already configured view.
 	void composite(uint16_t view);
 
 	bool available() const { return m_available; }

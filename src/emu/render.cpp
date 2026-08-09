@@ -650,11 +650,15 @@ void render_container::set_user_settings(const user_settings &settings)
 //  add_line - add a line item to this container
 //-------------------------------------------------
 
-void render_container::add_line(float x0, float y0, float x1, float y1, float width, rgb_t argb, u32 flags)
+void render_container::add_line(float x0, float y0, float x1, float y1, float width, rgb_t argb, u32 flags, float vector_start_time, float vector_ramp_duration, float vector_beam_on_duration, float vector_total_duration)
 {
 	item &newitem = add_generic(CONTAINER_ITEM_LINE, x0, y0, x1, y1, argb);
 	newitem.m_width = width;
 	newitem.m_flags = flags;
+	newitem.m_vector_start_time = vector_start_time;
+	newitem.m_vector_ramp_duration = vector_ramp_duration;
+	newitem.m_vector_beam_on_duration = vector_beam_on_duration;
+	newitem.m_vector_total_duration = vector_total_duration;
 }
 
 
@@ -2592,6 +2596,10 @@ void render_target::add_container_primitives(render_primitive_list &list, const 
 
 				// scale the width by the minimum of X/Y scale factors
 				prim->width = curitem.width() * std::min(container_xform.xscale, container_xform.yscale);
+				prim->vector_start_time = curitem.vector_start_time();
+				prim->vector_ramp_duration = curitem.vector_ramp_duration();
+				prim->vector_beam_on_duration = curitem.vector_beam_on_duration();
+				prim->vector_total_duration = curitem.vector_total_duration();
 				prim->flags |= curitem.flags();
 
 				// clip the primitive
