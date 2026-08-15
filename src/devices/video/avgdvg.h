@@ -77,6 +77,7 @@ protected:
 	void vg_set_halt(int dummy);
 
 	void vg_flush();
+	void vg_clear_list();
 	void vg_finalize_pending_beam();
 	void vg_add_point_buf(int x, int y, rgb_t color, int intensity, u64 ramp_duration, bool beam_remains_on = true, u64 start_offset = 0);
 	void vg_add_clip(int xmin, int ymin, int xmax, int ymax);
@@ -91,7 +92,14 @@ protected:
 	int m_nvect;
 	vgvector m_vectbuf[MAXVECT];
 	u64 m_state_time;
+	// list epoch       batch 1             batch 2
+	//      |-------------|-------------------|
+	//      ^             ^
+	// list start      buffer start moves here
+	// Moving boundary between buffered batches, advanced to each flushed batch's furthest scheduled end.
 	u64 m_vector_buffer_start_time;
+	// Fixed hardware-clock epoch for the current rendered list, used to produce list-relative point timestamps.
+	u64 m_vector_list_start_time;
 	u64 m_pending_beam_start;
 	int m_pending_beam_vector;
 

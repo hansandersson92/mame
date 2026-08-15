@@ -32,6 +32,13 @@ protected:
 class vector_device : public device_t, public device_video_output_interface
 {
 public:
+	struct point_timing
+	{
+		attotime start_time = attotime::never;
+		attotime ramp_duration = attotime::never;
+		attotime beam_on_duration = attotime::never;
+	};
+
 	using frame_begin_delegate = delegate<void ()>;
 	using frame_end_delegate = delegate<void ()>;
 	using move_delegate = delegate<void (int, int, uint32_t, int, int)>;
@@ -56,8 +63,9 @@ public:
 	std::pair<unsigned, unsigned> physical_aspect() const override;
 
 	void clear_list();
-	void add_point(int x, int y, rgb_t color, int intensity, attotime ramp_duration = attotime::never, attotime beam_on_duration = attotime::never);
-	void advance_time(attotime duration);
+	void add_point(int x, int y, rgb_t color, int intensity);
+	void add_point(int x, int y, rgb_t color, int intensity, point_timing timing);
+	void set_total_duration(attotime duration);
 
 	// configuration
 	template <typename T> vector_device &set_refresh_hz(T &&hz) { m_frame_period = attotime::from_hz(hz); return *this; }
@@ -124,8 +132,8 @@ private:
 	std::unique_ptr<point[]> m_vector_list;
 	struct point m_prevpoint;
 	int m_vector_index;
-	// Current elapsed time in the generated vector display list.
-	attotime m_vector_time;
+	// Elapsed time from the current vector list's epoch to its furthest scheduled end.
+	attotime m_vector_total_duration;
 	int m_min_intensity;
 	int m_max_intensity;
 

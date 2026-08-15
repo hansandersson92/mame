@@ -103,22 +103,33 @@ void avgdvg_device_base::vg_flush()
 {
 	vg_finalize_pending_beam();
 
+	// The hardware clock is authoritative. Account for scheduled vector and
+	// beam intervals that extend beyond the state-machine time at flush entry.
+	u64 list_end_time = std::max(m_state_time, m_vector_buffer_start_time);
+	for (int vector = 0; vector < m_nvect; vector++)
+	{
+		if (m_vectbuf[vector].status == VGVECTOR)
+		{
+			u64 const operation_duration = std::max(
+					m_vectbuf[vector].ramp_duration,
+					m_vectbuf[vector].beam_on_duration);
+			list_end_time = std::max(
+					list_end_time,
+					m_vectbuf[vector].start_time + operation_duration);
+		}
+	}
+
 	int cx0 = 0, cy0 = 0, cx1 = 0x5000000, cy1 = 0x5000000;
 	int i = 0;
-	u64 timeline_cursor = m_vector_buffer_start_time;
-	auto const advance_timeline = [this, &timeline_cursor] (u64 duration)
-	{
-		m_vector->advance_time(attotime::from_ticks(duration, MASTER_CLOCK));
-		timeline_cursor += duration;
-	};
 
 	while ((i < m_nvect) && (m_vectbuf[i].status == VGCLIP))
 		i++;
 	if (i == m_nvect)
 	{
-		if (m_state_time > timeline_cursor)
-			advance_timeline(m_state_time - timeline_cursor);
-		m_vector_buffer_start_time = std::max(m_state_time, timeline_cursor);
+		m_vector->set_total_duration(attotime::from_ticks(
+				list_end_time - m_vector_list_start_time,
+				MASTER_CLOCK));
+		m_vector_buffer_start_time = list_end_time;
 		m_nvect = 0;
 		return;
 	}
@@ -129,9 +140,6 @@ void avgdvg_device_base::vg_flush()
 	{
 		if (m_vectbuf[i].status == VGVECTOR)
 		{
-			if (m_vectbuf[i].start_time > timeline_cursor)
-				advance_timeline(m_vectbuf[i].start_time - timeline_cursor);
-
 			int xe = m_vectbuf[i].x;
 			int ye = m_vectbuf[i].y;
 			int x0 = xs, y0 = ys, x1 = xe, y1 = ye;
@@ -146,12 +154,7 @@ void avgdvg_device_base::vg_flush()
 			ys = ye;
 
 			if ((x0 < cx0 && x1 < cx0) || (x0 > cx1 && x1 > cx1))
-			{
-				// A rejected operation has no visible geometry, but still consumes
-				// its complete vector-generator duration.
-				advance_timeline(ramp_duration);
 				continue;
-			}
 
 			if (x0 < cx0)
 			{
@@ -175,10 +178,7 @@ void avgdvg_device_base::vg_flush()
 			}
 
 			if ((y0 < cy0 && y1 < cy0) || (y0 > cy1 && y1 > cy1))
-			{
-				advance_timeline(ramp_duration);
 				continue;
-			}
 
 			if (y0 < cy0)
 			{
@@ -219,31 +219,35 @@ void avgdvg_device_base::vg_flush()
 				? beam_on_duration
 				: segment_cycles_at_fraction(beam_on_duration, visible.end) -
 					segment_cycles_at_fraction(beam_on_duration, visible.start);
+			u64 const visible_start_time = m_vectbuf[i].start_time + visible_start;
+			assert(visible_start_time >= m_vector_list_start_time);
+			vector_device::point_timing const blank_timing
+			{
+				attotime::from_ticks(visible_start_time - m_vector_list_start_time, MASTER_CLOCK),
+				attotime::zero,
+				attotime::zero
+			};
+			vector_device::point_timing const visible_timing
+			{
+				blank_timing.start_time,
+				attotime::from_ticks(visible_end - visible_start, MASTER_CLOCK),
+				attotime::from_ticks(visible_beam_on_duration, MASTER_CLOCK)
+			};
 
-			// Partition, rather than duplicate, the original segment duration:
-			//
-			//   leading non-visible interval + visible traversal interval
-			//       + trailing non-visible interval = ramp_duration
-			//
-			// Advance non-visible time directly.  The zero-duration blank endpoint only
-			// establishes the visible start coordinate; it does not carry timing.
-			advance_timeline(visible_start);
+			// The zero-duration blank endpoint establishes the visible start
+			// coordinate. Both endpoints carry the authoritative list-relative start.
 			m_vector->add_point(
 					x0,
 					y0,
 					m_vectbuf[i].color,
 					0,
-					attotime::zero,
-					attotime::zero);
+					blank_timing);
 			m_vector->add_point(
 					x1,
 					y1,
 					m_vectbuf[i].color,
 					m_vectbuf[i].intensity,
-					attotime::from_ticks(visible_end - visible_start, MASTER_CLOCK),
-					attotime::from_ticks(visible_beam_on_duration, MASTER_CLOCK));
-			timeline_cursor += visible_end - visible_start;
-			advance_timeline(ramp_duration - visible_end);
+					visible_timing);
 		}
 
 		if (m_vectbuf[i].status == VGCLIP)
@@ -260,10 +264,17 @@ void avgdvg_device_base::vg_flush()
 		}
 	}
 
-	if (m_state_time > timeline_cursor)
-		advance_timeline(m_state_time - timeline_cursor);
-	m_vector_buffer_start_time = std::max(m_state_time, timeline_cursor);
+	m_vector->set_total_duration(attotime::from_ticks(
+			list_end_time - m_vector_list_start_time,
+			MASTER_CLOCK));
+	m_vector_buffer_start_time = list_end_time;
 	m_nvect = 0;
+}
+
+void avgdvg_device_base::vg_clear_list()
+{
+	m_vector->clear_list();
+	m_vector_list_start_time = m_vector_buffer_start_time;
 }
 
 void avgdvg_device_base::vg_finalize_pending_beam()
@@ -755,7 +766,7 @@ int avg_device::avg_common_strobe2()
 				 * 'frames'.
 				 */
 
-				m_vector->clear_list();
+				vg_clear_list();
 				vg_flush();
 			}
 		}
@@ -1462,7 +1473,7 @@ void avgdvg_device_base::go_w(u8 data)
 		 * sometimes sets VGGO after a very short vector list. That's
 		 * why we ignore frames with less than 10 vectors.
 		 */
-		m_vector->clear_list();
+		vg_clear_list();
 	}
 	vg_flush();
 
@@ -1535,8 +1546,10 @@ void avgdvg_device_base::device_post_load()
 	// their stale pre-load contents and restart timing at the restored clock.
 	m_nvect = 0;
 	m_vector_buffer_start_time = m_state_time;
+	m_vector_list_start_time = m_state_time;
 	m_pending_beam_start = m_state_time;
 	m_pending_beam_vector = -1;
+	m_vector->clear_list();
 }
 
 void dvg_device::device_start()
@@ -1637,6 +1650,7 @@ avgdvg_device_base::avgdvg_device_base(const machine_config &mconfig, device_typ
 	m_nvect(0),
 	m_state_time(0),
 	m_vector_buffer_start_time(0),
+	m_vector_list_start_time(0),
 	m_pending_beam_start(0),
 	m_pending_beam_vector(-1),
 	m_pc(0),

@@ -54,7 +54,7 @@ vector_device::vector_device(const machine_config &mconfig, const char *tag, dev
 		device_video_output_interface(mconfig, *this),
 		m_vector_list(nullptr),
 		m_vector_index(0),
-		m_vector_time(attotime::zero),
+		m_vector_total_duration(attotime::never),
 		m_min_intensity(255),
 		m_max_intensity(0),
 		m_visarea(rectangle()),
@@ -169,38 +169,31 @@ float vector_device::normalized_sigmoid(float n, float k)
 #define VECTOR_TIMING_REGRESSION_TEST 0
 
 //-------------------------------------------------
-// Adds a timed line endpoint to the vector list. The display-list cursor is
-// advanced by the X/Y ramp only. beam_on_duration describes exposure and does
-// not independently advance time because it can overlap ramp or other
-// generator activity. Callers must use advance_time for every non-ramp
-// interval before submitting the next operation or completing the list.
+// Adds a line endpoint and its generator-supplied timing to the vector list.
+// Timed generators provide start_time relative to the beginning of the current
+// display list. Untimed generators leave all timing values at attotime::never.
 //-------------------------------------------------
 
-void vector_device::add_point(int x, int y, rgb_t color, int intensity, attotime ramp_duration, attotime beam_on_duration)
+void vector_device::add_point(int x, int y, rgb_t color, int intensity)
 {
-#ifdef VECTOR_TIMING_REGRESSION_TEST
-ramp_duration = attotime::never;
-beam_on_duration = attotime::never;
+	add_point(x, y, color, intensity, point_timing { });
+}
+
+void vector_device::add_point(int x, int y, rgb_t color, int intensity, point_timing timing)
+{
+#if VECTOR_TIMING_REGRESSION_TEST
+	timing = point_timing { };
 #endif
 	point *newpoint;
-	ramp_duration = ramp_duration.is_never()
+	timing.start_time = timing.start_time.is_never()
 		? attotime::never
-		: std::max(ramp_duration, attotime::zero);
-	beam_on_duration = beam_on_duration.is_never()
+		: std::max(timing.start_time, attotime::zero);
+	timing.ramp_duration = timing.ramp_duration.is_never()
 		? attotime::never
-		: std::max(beam_on_duration, attotime::zero);
-
-	attotime start_time = attotime::never;
-	if (!m_vector_time.is_never())
-	{
-		if (ramp_duration.is_never())
-			m_vector_time = attotime::never;
-		else
-		{
-			start_time = m_vector_time;
-			m_vector_time += ramp_duration;
-		}
-	}
+		: std::max(timing.ramp_duration, attotime::zero);
+	timing.beam_on_duration = timing.beam_on_duration.is_never()
+		? attotime::never
+		: std::max(timing.beam_on_duration, attotime::zero);
 
 	intensity = std::clamp(intensity, 0, 255);
 
@@ -221,9 +214,9 @@ beam_on_duration = attotime::never;
 	newpoint->y = y;
 	newpoint->col = color;
 	newpoint->intensity = intensity;
-	newpoint->start_time = start_time;
-	newpoint->ramp_duration = ramp_duration;
-	newpoint->beam_on_duration = beam_on_duration;
+	newpoint->start_time = timing.start_time;
+	newpoint->ramp_duration = timing.ramp_duration;
+	newpoint->beam_on_duration = timing.beam_on_duration;
 
 	m_vector_index++;
 	if (m_vector_index >= MAX_POINTS)
@@ -235,18 +228,18 @@ beam_on_duration = attotime::never;
 
 
 //-------------------------------------------------
-// Advance the complete display-list timeline without adding an X/Y ramp.
-// This includes fetch/state-machine gaps and any remainder of a Z-on dwell
-// after its associated ramp. The duration may overlap beam exposure, so this
-// function does not imply that the beam is blanked.
+// Sets the complete duration supplied by a timed vector generator. This is
+// independent of point visibility and includes generator activity outside X/Y
+// ramps. Untimed generators leave the duration unavailable.
 //-------------------------------------------------
 
-void vector_device::advance_time(attotime duration)
+void vector_device::set_total_duration(attotime duration)
 {
-#ifdef VECTOR_TIMING_REGRESSION_TEST
-	return;
+#if VECTOR_TIMING_REGRESSION_TEST
+	m_vector_total_duration = attotime::never;
+#else
+	m_vector_total_duration = std::max(duration, attotime::zero);
 #endif
-	m_vector_time += duration;
 }
 
 
@@ -258,7 +251,7 @@ void vector_device::advance_time(attotime duration)
 void vector_device::clear_list()
 {
 	m_vector_index = 0;
-	m_vector_time = attotime::zero;
+	m_vector_total_duration = attotime::never;
 }
 
 //-------------------------------------------------
@@ -271,7 +264,7 @@ bool vector_device::video_output_update()
 		m_vector_update(*this);
 
 	auto const seconds = [] (attotime duration) { return duration.is_never() ? -1.0F : float(duration.as_double()); };
-	float const total_duration = seconds(m_vector_time);
+	float const total_duration = seconds(m_vector_total_duration);
 
 	uint32_t flags = PRIMFLAG_ANTIALIAS(1) | PRIMFLAG_BLENDMODE(BLENDMODE_ADD) | PRIMFLAG_VECTOR(1);
 	const rectangle &visarea = m_visarea;
