@@ -109,6 +109,7 @@ private:
 	float m_persistence;
 	float m_beam_width;
 	float m_beam_intensity;
+	float m_timed_beam_current_gain;
 	float m_halo;
 	float m_bloom_strength;
 	float m_bloom_radius;

@@ -30,6 +30,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
 
 
 namespace {
@@ -49,8 +50,74 @@ constexpr float CORE_FWHM_1080 = 1.0f;
 constexpr float LEGACY_UNTIMED_BEAM_WIDTH_SCALE = 0.75f;
 constexpr float LEGACY_UNTIMED_BEAM_SIGMA_SCALE = 0.085f;
 
+/*
+ * Timed phosphor operating-point calibration at 1080 vertical pixels. A
+ * 60-second Asteroids sample measured the median peak core response of moving
+ * lines before the global energy rate as 2.72562e-7. Map that reference
+ * response to 0.10 pre-emission excitation:
+ *
+ *   BEAM_ENERGY_RATE_1080 = 0.10 / 2.72562e-7
+ *                         = 366889.001402
+ *
+ * This is a reference operating point for useful phosphor dynamic range, not
+ * an absolute luminance measurement of a real CRT.
+ */
+constexpr double REFERENCE_CORE_RESPONSE_1080 = 2.72562e-7;
+constexpr double REFERENCE_PHOSPHOR_EXCITATION = 0.10;
+constexpr double BEAM_ENERGY_RATE_1080 =
+		REFERENCE_PHOSPHOR_EXCITATION /
+		REFERENCE_CORE_RESPONSE_1080;
+
+// Restore the reference moving-line median to approximately RGB 189 while
+// retaining a smooth, unclipped output ceiling that quantizes to RGB 255.
+constexpr float TIMED_REFERENCE_EXPOSURE = 7.656055f;
+constexpr float LEGACY_UNTIMED_EXPOSURE = 0.78f;
+
 constexpr double SQRT_TWO_PI = 2.5066282746310002;
 constexpr double TWO_PI = 6.2831853071795865;
+
+// Temporary game-name lookup for testing monitor-family beam-current gains.
+// This is deliberately not the final monitor-profile architecture.
+struct timed_beam_gain_entry
+{
+	char const *game;
+	float gain;
+};
+
+constexpr timed_beam_gain_entry TIMED_BEAM_GAIN_TESTS[] =
+{
+	// B&W Electrohome G05 / Wells-Gardner V2000 population.
+	{ "asteroid", 1.12f },
+	{ "astdelux", 1.12f },
+	{ "llander",  1.12f },
+	{ "omegrace", 1.12f },
+	{ "bzone",    1.12f },
+	{ "redbaron", 1.12f },
+
+	// Color Wells-Gardner 6100 analysis population.
+	{ "spacduel", 1.22f },
+	{ "bwidow",   1.22f },
+	{ "gravitar", 1.22f },
+	{ "tempest",  1.22f },
+	{ "quantum",  1.22f },
+
+	// Color Amplifone analysis population.
+	{ "mhavoc",   3.43f },
+	{ "starwars", 3.43f },
+	{ "esb",      3.43f }
+};
+
+float timed_beam_gain_for_game(char const *game)
+{
+	for (timed_beam_gain_entry const &entry : TIMED_BEAM_GAIN_TESTS)
+	{
+		if (!std::strcmp(game, entry.game))
+			return entry.gain;
+	}
+	return 1.0f;
+}
+
+// #define VECTOR_CRT_LOG_COLOR_RESPONSE
 
 constexpr uint64_t TARGET_FLAGS =
 		BGFX_TEXTURE_RT |
@@ -111,6 +178,7 @@ bgfx_vector_renderer::bgfx_vector_renderer(effect_manager &effects, osd_options 
 	, m_persistence(0.0f)
 	, m_beam_width(0.0f)
 	, m_beam_intensity(0.0f)
+	, m_timed_beam_current_gain(timed_beam_gain_for_game(options.system_name()))
 	, m_halo(0.0f)
 	, m_bloom_strength(0.0f)
 	, m_bloom_radius(0.0f)
@@ -333,6 +401,14 @@ void bgfx_vector_renderer::draw_beams(uint16_t view, double frame_time)
 					? total_duration
 					: frame_time;
 
+	// Timed excitation is calibrated by BEAM_ENERGY_RATE_1080. Apply the
+	// temporary game/monitor gain experiment only to timed rendering; retain
+	// the former user gain for untimed compatibility rendering.
+	float const beam_energy_gain =
+			have_timing
+					? m_timed_beam_current_gain
+					: m_beam_intensity;
+
 	float const timed_core_fwhm =
 			CORE_FWHM_1080 *
 			(float(m_height) / 1080.0f) *
@@ -422,8 +498,6 @@ void bgfx_vector_renderer::draw_beams(uint16_t view, double frame_time)
 	 * Gaussian integral used by the shader.  The integral scales
 	 * with pixel area, hence the square of vertical resolution.
 	 */
-	constexpr double BEAM_ENERGY_RATE_1080 = 1.58e6;
-
 	double const resolution_scale =
 			double(m_height) / 1080.0;
 
@@ -431,6 +505,178 @@ void bgfx_vector_renderer::draw_beams(uint16_t view, double frame_time)
 			BEAM_ENERGY_RATE_1080 *
 			resolution_scale *
 			resolution_scale;
+
+#ifdef VECTOR_CRT_LOG_COLOR_RESPONSE
+	if (have_timing)
+	{
+		struct color_response_samples
+		{
+			std::vector<double> intensity;
+			std::vector<double> excitation;
+			std::vector<double> aged_excitation;
+			std::vector<double> excitation_per_intensity;
+			std::vector<double> beam_on_per_pixel_1080;
+			std::vector<double> predicted_rgb;
+		};
+		static std::map<int, color_response_samples> samples;
+		static double elapsed = 0.0;
+		static bool logged = false;
+		constexpr double WARMUP_SECONDS = 5.0;
+		constexpr double SAMPLE_SECONDS = 60.0;
+
+		if (!logged)
+		{
+			auto const capsule_integral = [] (double sigma, double length)
+			{
+				return SQRT_TWO_PI * sigma * length + TWO_PI * sigma * sigma;
+			};
+
+			elapsed += frame_time;
+			bool const collecting =
+					(elapsed > WARMUP_SECONDS) &&
+					(elapsed <= (WARMUP_SECONDS + SAMPLE_SECONDS));
+
+			if (collecting)
+			for (render_primitive const *const primitive : m_vectors)
+			{
+				double const intensity = double(primitive->color.a);
+				double const beam_on_duration =
+						double(primitive->vector_beam_on_duration);
+				double const dx = primitive->bounds.x1 - primitive->bounds.x0;
+				double const dy = primitive->bounds.y1 - primitive->bounds.y0;
+				double const length = std::sqrt(dx * dx + dy * dy);
+				if ((intensity <= 0.0) || (beam_on_duration <= 0.0))
+					continue;
+
+				double const core_sigma = std::max(double(timed_core_sigma), 0.01);
+				double const halo_sigma = core_sigma * 3.5;
+				double const filtered_core_sigma =
+						std::sqrt(core_sigma * core_sigma + (1.0 / 12.0));
+				double const filtered_halo_sigma =
+						std::sqrt(halo_sigma * halo_sigma + (1.0 / 12.0));
+				double const core_integral = capsule_integral(core_sigma, length);
+				double const halo_integral = capsule_integral(halo_sigma, length);
+				double const spatial_integral =
+						core_integral + double(m_halo) * halo_integral;
+				double const peak_radial =
+						core_integral / capsule_integral(filtered_core_sigma, length) +
+						double(m_halo) * halo_integral /
+								capsule_integral(filtered_halo_sigma, length);
+				double const excitation =
+						intensity * beam_on_duration *
+						peak_radial / spatial_integral * energy_rate *
+						double(beam_energy_gain);
+
+				double const arrival = std::clamp(
+						(double(primitive->vector_start_time) +
+						 0.5 * double(primitive->vector_ramp_duration)) /
+								total_duration,
+						0.0,
+						1.0);
+				double const scan_persistence = std::max(
+						double(m_persistence),
+						frame_time * 10.0);
+				double const temporal = std::exp(
+						-total_duration * (1.0 - arrival) /
+						scan_persistence);
+				double const aged_excitation = excitation * temporal;
+
+				double const red = double(primitive->color.r);
+				double const green = double(primitive->color.g);
+				double const blue = double(primitive->color.b);
+				int const color_mask =
+						((red > 0.5) ? 1 : 0) |
+						((green > 0.5) ? 2 : 0) |
+						((blue > 0.5) ? 4 : 0);
+				if (!color_mask)
+					continue;
+				bool const is_dot = length <= 0.0001;
+				double const excitation_luminance =
+						aged_excitation *
+						(0.2126 * red + 0.7152 * green + 0.0722 * blue);
+				double const emission_scale =
+						excitation_luminance > 1.0e-6
+								? -std::expm1(-excitation_luminance) /
+										excitation_luminance
+								: 1.0;
+				double const exposure =
+						double(TIMED_REFERENCE_EXPOSURE * m_exposure);
+				double const hdr_luminance =
+						excitation_luminance * emission_scale * exposure;
+				double const mapped_scale =
+						hdr_luminance > 1.0e-6
+								? -std::expm1(-hdr_luminance) / hdr_luminance
+								: 1.0;
+				double const peak_channel =
+						std::max({ red, green, blue }) *
+						aged_excitation * emission_scale * exposure * mapped_scale;
+				double const predicted_rgb =
+						255.0 * std::pow(std::max(peak_channel, 0.0), 1.0 / 2.2);
+
+				auto &color_samples = samples[color_mask | (is_dot ? 8 : 0)];
+				color_samples.intensity.emplace_back(intensity);
+				color_samples.excitation.emplace_back(excitation);
+				color_samples.aged_excitation.emplace_back(aged_excitation);
+				color_samples.excitation_per_intensity.emplace_back(
+						excitation / intensity);
+				if (!is_dot)
+				{
+					color_samples.beam_on_per_pixel_1080.emplace_back(
+							beam_on_duration * resolution_scale / length);
+				}
+				color_samples.predicted_rgb.emplace_back(predicted_rgb);
+			}
+
+			if (elapsed >= (WARMUP_SECONDS + SAMPLE_SECONDS))
+			{
+				auto const percentile = [] (std::vector<double> &values, double fraction)
+				{
+					std::sort(values.begin(), values.end());
+					return values[size_t(fraction * double(values.size() - 1))];
+				};
+				for (auto &[sample_key, values] : samples)
+				{
+					bool const is_dot = bool(sample_key & 8);
+					int const color_mask = sample_key & 7;
+					osd_printf_verbose(
+							"Vector CRT %s color=%d samples=%llu "
+							"Z[p25=%g p50=%g p75=%g] "
+							"E[p25=%g p50=%g p75=%g] "
+							"agedE[p25=%g p50=%g p75=%g] "
+							"E/Z[p25=%g p50=%g p75=%g] "
+							"RGB[p25=%g p50=%g p75=%g]\n",
+							is_dot ? "dot" : "line",
+							color_mask,
+							(unsigned long long)values.excitation.size(),
+							percentile(values.intensity, 0.25),
+							percentile(values.intensity, 0.50),
+							percentile(values.intensity, 0.75),
+							percentile(values.excitation, 0.25),
+							percentile(values.excitation, 0.50),
+							percentile(values.excitation, 0.75),
+							percentile(values.aged_excitation, 0.25),
+							percentile(values.aged_excitation, 0.50),
+							percentile(values.aged_excitation, 0.75),
+							percentile(values.excitation_per_intensity, 0.25),
+							percentile(values.excitation_per_intensity, 0.50),
+							percentile(values.excitation_per_intensity, 0.75),
+							percentile(values.predicted_rgb, 0.25),
+							percentile(values.predicted_rgb, 0.50),
+							percentile(values.predicted_rgb, 0.75));
+					if (!is_dot)
+					{
+						osd_printf_verbose(
+								"  beam-on @1080 [us/pixel]: p25=%g p50=%g p75=%g\n",
+								percentile(values.beam_on_per_pixel_1080, 0.25) * 1.0e6,
+								percentile(values.beam_on_per_pixel_1080, 0.50) * 1.0e6,
+								percentile(values.beam_on_per_pixel_1080, 0.75) * 1.0e6);
+					}
+				}
+				logged = true;
+			}
+		}
+	}
+#endif
 
 #ifdef VECTOR_CRT_LOG_ENERGY_RATE
 	bool const calibration_valid =
@@ -473,7 +719,7 @@ void bgfx_vector_renderer::draw_beams(uint16_t view, double frame_time)
 			"u_vector_params",
 			float(frame_time),
 			m_persistence,
-			m_beam_intensity,
+			beam_energy_gain,
 			m_halo);
 
 	set_uniform(
@@ -775,7 +1021,30 @@ void bgfx_vector_renderer::composite(uint16_t view)
 
 	bgfx::setTexture(0, m_composite_effect->uniform("s_accum")->handle(), m_accumulation[m_current_accumulation].texture, SAMPLE_FLAGS);
 	bgfx::setTexture(1, m_composite_effect->uniform("s_bloom")->handle(), m_bloom[0].texture, SAMPLE_FLAGS);
-	set_uniform(m_composite_effect, "u_composite", m_bloom_strength, m_exposure, 2.2f, 0.0f);
+	bool const have_timing =
+			!m_vectors.empty() &&
+			std::all_of(
+					m_vectors.begin(),
+					m_vectors.end(),
+					[] (render_primitive const *primitive)
+					{
+						return
+								(primitive->vector_start_time >= 0.0F) &&
+								(primitive->vector_ramp_duration >= 0.0F) &&
+								(primitive->vector_beam_on_duration >= 0.0F) &&
+								(primitive->vector_total_duration > 0.0F);
+					});
+	float const base_exposure =
+			have_timing
+					? TIMED_REFERENCE_EXPOSURE
+					: LEGACY_UNTIMED_EXPOSURE;
+	set_uniform(
+			m_composite_effect,
+			"u_composite",
+			m_bloom_strength,
+			base_exposure * m_exposure,
+			2.2f,
+			0.0f);
 	draw_post(m_composite_effect, view);
 }
 
@@ -794,11 +1063,11 @@ void bgfx_vector_renderer::create_sliders()
 	{
 		{ "Vector phosphor persistence",   1,   2, 100, 1 },   // 0.02
 		{ "Vector core FWHM scale",       30, 100, 400, 1 },   // 1.00
-		{ "Vector beam intensity",        10, 400, 500, 1 },   // 4.00
+		{ "Vector untimed beam intensity", 10, 400, 500, 1 },  // 4.00
 		{ "Vector beam halo",              0,   4, 100, 1 },   // 0.04
 		{ "Vector bloom strength",         0,  20, 300, 1 },   // 0.20
 		{ "Vector bloom radius",          50, 212, 260, 1 },   // 2.12
-		{ "Vector exposure",              10,  78, 400, 1 },   // 0.78
+		{ "Vector exposure scale",        10, 100, 400, 1 },   // 1.00
 	};
 
 	m_sliders.reserve(SLIDER_COUNT);
