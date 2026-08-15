@@ -36,9 +36,18 @@ namespace {
 
 constexpr unsigned BLOOM_PASSES = 2;
 
-// Empirical conversion from MAME's target-pixel line width to Gaussian sigma.
-// This controls profile calibration; it is not a resolution-scaling factor.
-constexpr float BEAM_SIGMA_SCALE = 0.085f;
+constexpr float GAUSSIAN_FWHM_TO_SIGMA = 2.354820045f;
+
+// Provisional timed core FWHM at 1080 lines. This is a rendering default, not
+// a measured CRT spot size. It scales with target height, so lower-resolution
+// targets may have a subpixel core; the shader's pixel-footprint integration
+// preserves its energy without silently clamping its physical width.
+constexpr float CORE_FWHM_1080 = 1.0f;
+
+// Preserve the previous primitive-width calculation for untimed generators.
+// The new width-control default is 1.0, so include the former default of 0.75.
+constexpr float LEGACY_UNTIMED_BEAM_WIDTH_SCALE = 0.75f;
+constexpr float LEGACY_UNTIMED_BEAM_SIGMA_SCALE = 0.085f;
 
 constexpr double SQRT_TWO_PI = 2.5066282746310002;
 constexpr double TWO_PI = 6.2831853071795865;
@@ -324,6 +333,14 @@ void bgfx_vector_renderer::draw_beams(uint16_t view, double frame_time)
 					? total_duration
 					: frame_time;
 
+	float const timed_core_fwhm =
+			CORE_FWHM_1080 *
+			(float(m_height) / 1080.0f) *
+			m_beam_width;
+	float const timed_core_sigma =
+			timed_core_fwhm /
+			GAUSSIAN_FWHM_TO_SIGMA;
+
 	double total_length = 0.0;
 
 #ifdef VECTOR_CRT_LOG_ENERGY_RATE
@@ -354,9 +371,12 @@ void bgfx_vector_renderer::draw_beams(uint16_t view, double frame_time)
 #ifdef VECTOR_CRT_LOG_ENERGY_RATE
 		double const sigma =
 				std::max(
-						double(primitive->width) *
-								m_beam_width *
-								BEAM_SIGMA_SCALE,
+						have_timing
+								? double(timed_core_sigma)
+								: double(primitive->width) *
+										m_beam_width *
+										LEGACY_UNTIMED_BEAM_WIDTH_SCALE *
+										LEGACY_UNTIMED_BEAM_SIGMA_SCALE,
 						0.01);
 
 		double const intensity =
@@ -540,9 +560,12 @@ void bgfx_vector_renderer::draw_beams(uint16_t view, double frame_time)
 			instance.blue = primitive.color.b;
 
 			instance.sigma =
-					primitive.width *
-					m_beam_width *
-					BEAM_SIGMA_SCALE;
+					have_timing
+							? timed_core_sigma
+							: primitive.width *
+									m_beam_width *
+									LEGACY_UNTIMED_BEAM_WIDTH_SCALE *
+									LEGACY_UNTIMED_BEAM_SIGMA_SCALE;
 
 			instance.start =
 					have_timing
@@ -770,7 +793,7 @@ void bgfx_vector_renderer::create_sliders()
 	static constexpr slider_description descriptions[SLIDER_COUNT] =
 	{
 		{ "Vector phosphor persistence",   1,   2, 100, 1 },   // 0.02
-		{ "Vector beam width",            30,  75, 400, 1 },   // 0.75
+		{ "Vector core FWHM scale",       30, 100, 400, 1 },   // 1.00
 		{ "Vector beam intensity",        10, 400, 500, 1 },   // 4.00
 		{ "Vector beam halo",              0,   4, 100, 1 },   // 0.04
 		{ "Vector bloom strength",         0,  20, 300, 1 },   // 0.20
