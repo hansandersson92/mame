@@ -1110,24 +1110,55 @@ int avg_starwars_device::handler_7() // starwars_strobe3
 
 	if (!OP0() && !OP2())
 	{
-		// Star Wars intensity DAC:
-		// 12k / 24k / 47k resistive current summing network.
-		// https://www.amazingarcading.com.au/Star-Wars-Schematic-Page-14B.jpg
-		constexpr float DAC_REFERENCE_RESISTOR = 12000.0f;
+		auto const intensity = [this]() -> int
+		{
+			// Star Wars Z-intensity circuit:
+			// https://www.amazingarcading.com.au/Star-Wars-Schematic-Page-14B.jpg
+			//
+			// Z2/Z1/Z0 set the DAC08 reference current through the
+			// 12k / 24k / 47k resistor network. DVY7-DVY0 supplies the
+			// 8-bit DAC value. The TL082 converts the DAC output current
+			// to ZREF through its 12k feedback resistor and adds a 1.8 V
+			// offset from the -15 V / 100k bias network.
 
-		const float dac =
-			((m_int_latch >> 3) & 1) * (DAC_REFERENCE_RESISTOR / 12000.0f) +
-			((m_int_latch >> 2) & 1) * (DAC_REFERENCE_RESISTOR / 24000.0f) +
-			((m_int_latch >> 1) & 1) * (DAC_REFERENCE_RESISTOR / 47000.0f);
+			u8 const zfield = (m_int_latch >> 1) & 0x07;
 
-		const float dac_full_scale =
-			(DAC_REFERENCE_RESISTOR / 12000.0f) +
-			(DAC_REFERENCE_RESISTOR / 24000.0f) +
-			(DAC_REFERENCE_RESISTOR / 47000.0f);
+			// Z2-Z0 = 000 asserts ZBLANK.
+			if (zfield == 0)
+				return 0;
 
-		// Normalize DAC output to the vector intensity range 0-255.
-		const int intensity =
-			int((dac / dac_full_scale) * m_intensity + 0.5f);
+			constexpr float LOGIC_HIGH = 5.0f;
+			constexpr float FEEDBACK_RESISTOR = 12000.0f;
+			constexpr float BIAS_RESISTOR = 100000.0f;
+			constexpr float NEGATIVE_SUPPLY_MAGNITUDE = 15.0f;
+
+			const float iref =
+				BIT(zfield, 2) * (LOGIC_HIGH / 12000.0f) +
+				BIT(zfield, 1) * (LOGIC_HIGH / 24000.0f) +
+				BIT(zfield, 0) * (LOGIC_HIGH / 47000.0f);
+
+			// DAC08 output current is approximately IREF * D / 256.
+			const float iout = iref * (float(m_intensity) / 256.0f);
+
+			// TL082 transimpedance amplifier. -15 V through 100k contributes
+			// a +1.8 V ZREF pedestal.
+			constexpr float zref_offset =
+				NEGATIVE_SUPPLY_MAGNITUDE * FEEDBACK_RESISTOR / BIAS_RESISTOR;
+
+			const float zref = zref_offset + iout * FEEDBACK_RESISTOR;
+
+			// Amplifone nominal intensity range is approximately 1 V black to
+			// 4 V full intensity. Preserve Star Wars overdrive above 255, capped
+			// at twice nominal renderer intensity.
+			constexpr float MONITOR_BLACK_LEVEL = 1.0f;
+			constexpr float MONITOR_MAX_LEVEL = 4.0f;
+
+			return std::clamp(
+				int((zref - MONITOR_BLACK_LEVEL) *
+					(255.0f / (MONITOR_MAX_LEVEL - MONITOR_BLACK_LEVEL)) + 0.5f),
+				0,
+				511);
+		}();
 
 		vg_add_point_buf(
 				m_xpos,
@@ -1145,6 +1176,47 @@ int avg_starwars_device::handler_7() // starwars_strobe3
 *  Quantum handler functions
 *
 *************************************/
+
+namespace {
+
+int quantum_z_intensity(u8 z)
+{
+	// Quantum schematic SP-221, sheet 8B.
+	// LS399 outputs drive a resistor DAC biased by R145/R144.
+	// Q12/Q13 approximately cancel their base-emitter offsets,
+	// so ZREF follows the DAC over most of the range.
+	//
+	// Amplifone operating range is approximately 1.0 V for black
+	// and 4.0 V for maximum intensity.
+
+	constexpr float VCC = 5.0f;
+	constexpr float MONITOR_BLACK_LEVEL = 1.0f;
+	constexpr float MONITOR_MAX_LEVEL = 4.0f;
+
+	constexpr float conductance =
+		1.0f / 3300.0f +
+		1.0f / 22000.0f +
+		1.0f / 1200.0f +
+		1.0f / 2200.0f +
+		1.0f / 4700.0f +
+		1.0f / 10000.0f;
+
+	const float zref =
+		(VCC / 3300.0f +
+		 BIT(z, 3) * VCC / 1200.0f +
+		 BIT(z, 2) * VCC / 2200.0f +
+		 BIT(z, 1) * VCC / 4700.0f +
+		 BIT(z, 0) * VCC / 10000.0f)
+		/ conductance;
+
+	return std::clamp(
+		int((zref - MONITOR_BLACK_LEVEL) *
+			(255.0f / (MONITOR_MAX_LEVEL - MONITOR_BLACK_LEVEL)) + 0.5f),
+		0,
+		255);
+}
+
+} // anonymous namespace
 
 void avg_quantum_device::update_databus() // quantum_data
 {
@@ -1283,11 +1355,31 @@ int avg_quantum_device::handler_7() // quantum_strobe3
 
 		apply_flipping(x, y);
 
+		auto const z = [this]() -> u8
+		{
+			// https://www.arcade-museum.com/manuals-videogames/Q/quantum-sp221.pdf
+			// LATCH3 latches DVG15-DVG12 as Z3-Z0 into m_int_latch.
+			u8 const zfield = m_int_latch & 0x0f;
+
+			// Z3-Z0 = 0000 blanks the beam through Q14.
+			if (zfield == 0)
+				return 0;
+
+			// SP-221 sheet 8B: Z3-Z0 = 0010 asserts LS399 WS,
+			// selecting word 2 supplied by DVY7-DVY4.
+			if (zfield == 2)
+				return m_intensity;
+
+			// Otherwise LS399 word 1 is selected. Its D,C,B,A inputs are
+			// 1,Z1,1,Z0 (unused TTL inputs assumed HIGH).
+			return 0x0a | ((zfield & 0x02) << 1) | (zfield & 0x01);
+		}();
+		int const intensity = quantum_z_intensity(z);
 		vg_add_point_buf(
 				y - m_ycenter + m_xcenter,
 				x - m_xcenter + m_ycenter,
 				rgb_t(r, g, b),
-				pal4bit((m_int_latch == 2) ? m_intensity : m_int_latch),
+				intensity,
 				cycles);
 	}
 	if (OP2())
