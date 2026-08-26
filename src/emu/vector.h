@@ -71,6 +71,7 @@ public:
 	template <typename T> vector_device &set_refresh_hz(T &&hz) { m_frame_period = attotime::from_hz(hz); return *this; }
 	void set_visarea(s16 minx, s16 maxx, s16 miny, s16 maxy) { m_visarea = rectangle(minx, maxx, miny, maxy); }
 	void set_color(rgb_t color) { m_color = color; }
+	void set_intensity_range(int range) { m_intensity_range = std::max(range, 1); m_min_intensity = m_intensity_range; }
 	auto screen_vblank() { return m_vblank.bind(); }
 
 	template <typename F>
@@ -134,6 +135,7 @@ private:
 	int m_vector_index;
 	// Elapsed time from the current vector list's epoch to its furthest scheduled end.
 	attotime m_vector_total_duration;
+	int m_intensity_range;
 	int m_min_intensity;
 	int m_max_intensity;
 

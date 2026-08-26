@@ -8,6 +8,7 @@
 	"uniforms": [
 		{ "name": "s_accum", "type": "int", "values": [ 0 ] },
 		{ "name": "s_bloom", "type": "int", "values": [ 1 ] },
-		{ "name": "u_composite", "type": "vec4", "values": [ 0.8, 1.0, 2.2, 0.1 ] }
+		{ "name": "u_composite", "type": "vec4", "values": [ 0.8, 1.0, 2.2, 0.1 ] },
+		{ "name": "u_phosphor_model", "type": "vec4", "values": [ 0.0, 0.0, 0.0, 0.0 ] }
 	]
 }

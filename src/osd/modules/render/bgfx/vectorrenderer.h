@@ -59,9 +59,9 @@ private:
 	enum slider_id : uint8_t
 	{
 		SLIDER_PERSISTENCE,
-		SLIDER_BEAM_WIDTH,
 		SLIDER_BEAM_INTENSITY,
-		SLIDER_HALO,
+		SLIDER_UNTIMED_HALO,
+		SLIDER_TAIL_FRACTION,
 		SLIDER_BLOOM_STRENGTH,
 		SLIDER_BLOOM_RADIUS,
 		SLIDER_EXPOSURE,
@@ -105,12 +105,12 @@ private:
 	bool m_reset_accumulation;
 	bool m_available;
 	bool m_present;
+	bool m_colour_monitor;
 
 	float m_persistence;
-	float m_beam_width;
 	float m_beam_intensity;
-	float m_timed_beam_current_gain;
-	float m_halo;
+	float m_untimed_halo;
+	float m_tail_fraction;
 	float m_bloom_strength;
 	float m_bloom_radius;
 	float m_exposure;

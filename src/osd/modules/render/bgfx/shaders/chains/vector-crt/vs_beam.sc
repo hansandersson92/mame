@@ -32,16 +32,16 @@ void main()
 	float intensity = max(i_data2.z, 0.0);
 	float timingEnabled = clamp(u_vector_timing.z, 0.0, 1.0);
 	float coreSigma = beam_core_sigma(baseSigma, intensity, timingEnabled);
-	float haloSigma = beam_halo_sigma(baseSigma, intensity, timingEnabled);
+	float broadSigma = beam_broad_sigma(baseSigma, intensity, timingEnabled);
 	float filteredCoreSigma = sqrt(coreSigma * coreSigma + BEAM_PIXEL_VARIANCE);
-	float filteredHaloSigma = sqrt(haloSigma * haloSigma + BEAM_PIXEL_VARIANCE);
+	float filteredBroadSigma = sqrt(broadSigma * broadSigma + BEAM_PIXEL_VARIANCE);
 
 	// a_position describes a unit segment quad: x selects an endpoint and y is
 	// the signed side. Extend it by six times the widest pixel-filtered sigma so
-	// neither the core nor halo is clipped by the quad boundary. Beam-local
+	// neither the core nor broad tail is clipped by the quad boundary. Beam-local
 	// coordinates are target pixels, making the pixel-box variance 1/12 here as
 	// in the fragment shader.
-	float padding = max(max(filteredCoreSigma, filteredHaloSigma) * 6.0, 1.0);
+	float padding = max(max(filteredCoreSigma, filteredBroadSigma) * 6.0, 1.0);
 	float along = mix(-padding, beamLength + padding, a_position.x);
 	float across = a_position.y * padding;
 	vec2 world = p0 + direction * along + normal * across;

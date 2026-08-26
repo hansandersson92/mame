@@ -55,6 +55,7 @@ vector_device::vector_device(const machine_config &mconfig, const char *tag, dev
 		m_vector_list(nullptr),
 		m_vector_index(0),
 		m_vector_total_duration(attotime::never),
+		m_intensity_range(255),
 		m_min_intensity(255),
 		m_max_intensity(0),
 		m_visarea(rectangle()),
@@ -195,8 +196,6 @@ void vector_device::add_point(int x, int y, rgb_t color, int intensity, point_ti
 		? attotime::never
 		: std::max(timing.beam_on_duration, attotime::zero);
 
-	intensity = std::clamp(intensity, 0, 255);
-
 	m_min_intensity = intensity > 0 ? std::min(m_min_intensity, intensity) : m_min_intensity;
 	m_max_intensity = intensity > 0 ? std::max(m_max_intensity, intensity) : m_max_intensity;
 
@@ -205,8 +204,6 @@ void vector_device::add_point(int x, int y, rgb_t color, int intensity, point_ti
 		float random = float(machine().rand() & 255) / 255.0f; // random value between 0.0 and 1.0
 
 		intensity -= int(intensity * random * vector_options::s_flicker);
-
-		intensity = std::clamp(intensity, 0, 255);
 	}
 
 	newpoint = &m_vector_list[m_vector_index];
@@ -289,8 +286,10 @@ bool vector_device::video_output_update()
 		float const ramp_duration = seconds(curpoint->ramp_duration);
 		float const beam_on_duration = seconds(curpoint->beam_on_duration);
 
-		float intensity = (float)curpoint->intensity / 255.0f;
-		float intensity_weight = normalized_sigmoid(intensity, vector_options::s_beam_intensity_weight);
+		int const ranged_intensity = std::clamp(curpoint->intensity, 0, m_intensity_range);
+		int const intensity = ranged_intensity * 255 / m_intensity_range;
+		float const beam_drive = float(std::max(curpoint->intensity, 0)) / 255.0f;
+		float const intensity_weight = normalized_sigmoid(float(intensity) / 255.0f, vector_options::s_beam_intensity_weight);
 
 		bool const is_dot = (m_prevpoint.x == curpoint->x) && (m_prevpoint.y == curpoint->y);
 
@@ -311,18 +310,19 @@ bool vector_device::video_output_update()
 		coords.x1 = (float(curpoint->x) - xoffs) * xscale;
 		coords.y1 = (float(curpoint->y) - yoffs) * yscale;
 
-		if (curpoint->intensity != 0)
+		if (intensity != 0)
 		{
 			container().add_line(
 					coords.x0, coords.y0, coords.x1, coords.y1,
 					beam_width,
-					(curpoint->intensity << 24) | (curpoint->col & 0xffffff),
-					flags | PRIMFLAG_VECTOR_DOT(is_dot ? 1 : 0),
+					(intensity << 24) | (curpoint->col & 0xffffff),
+					flags,
 					point_start,
 					ramp_duration,
 					beam_on_duration,
-					total_duration);
-			m_line_notifier(m_prevpoint.x, m_prevpoint.y, curpoint->x, curpoint->y, curpoint->col, curpoint->intensity, visarea.width(), visarea.height());
+					total_duration,
+					beam_drive);
+			m_line_notifier(m_prevpoint.x, m_prevpoint.y, curpoint->x, curpoint->y, curpoint->col, intensity, visarea.width(), visarea.height());
 		}
 		else
 		{

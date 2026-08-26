@@ -11,6 +11,31 @@ $input v_texcoord0
 SAMPLER2D(s_accum, 0);
 SAMPLER2D(s_bloom, 1);
 uniform vec4 u_composite;
+uniform vec4 u_phosphor_model;
+
+#define DISPLAY_TONE_MAP_KNEE 0.75
+
+// Preserve scene-linear luminance ratios through the ordinary operating
+// range, introducing a smooth shoulder only near the SDR output ceiling.
+float tone_map_luminance(float luminance)
+{
+	return
+		luminance <= DISPLAY_TONE_MAP_KNEE
+			? luminance
+			: DISPLAY_TONE_MAP_KNEE +
+				(1.0 - DISPLAY_TONE_MAP_KNEE) *
+				(1.0 - exp(
+					-(luminance - DISPLAY_TONE_MAP_KNEE) /
+					(1.0 - DISPLAY_TONE_MAP_KNEE)));
+}
+
+// Convert emitted monochrome P4 phosphor light to the renderer's linear-sRGB
+// working space using its nominal blue-white chromaticity.
+vec3 p4_to_linear_srgb(vec3 phosphor)
+{
+	const vec3 P4_WHITE = vec3(0.805, 1.014, 1.445);
+	return phosphor * P4_WHITE;
+}
 
 // Provisional generic P22 phosphor conversion, derived from MAME's existing
 // HLSL chromaticity defaults:
@@ -40,10 +65,13 @@ void main()
 			texture2D(s_bloom, v_texcoord0).rgb,
 			vec3_splat(0.0));
 
-	vec3 hdr =
-			p22_to_linear_srgb(
-					phosphor + bloom * u_composite.x) *
-			u_composite.y;
+	vec3 emitted = phosphor + bloom * u_composite.x;
+	vec3 monitorColor;
+	if (u_phosphor_model.x > 0.5)
+		monitorColor = p4_to_linear_srgb(emitted);
+	else
+		monitorColor = p22_to_linear_srgb(emitted);
+	vec3 hdr = monitorColor * u_composite.y;
 
 	// Tone-map luminance rather than each RGB channel separately.
 	// This retains the saturation and hue of bright vector colors.
@@ -51,8 +79,10 @@ void main()
 			hdr,
 			vec3(0.2126, 0.7152, 0.0722));
 
-	float mappedLuminance =
-			1.0 - exp(-luminance);
+	float mappedLuminance = mix(
+			1.0 - exp(-luminance),
+			tone_map_luminance(luminance),
+			clamp(u_phosphor_model.y, 0.0, 1.0));
 
 	vec3 mapped =
 			luminance > 0.0001

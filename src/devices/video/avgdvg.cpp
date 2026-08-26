@@ -31,7 +31,6 @@
 #define VGVECTOR 0
 #define VGCLIP 1
 
-
 namespace {
 
 struct segment_interval
@@ -1147,15 +1146,17 @@ int avg_starwars_device::handler_7() // starwars_strobe3
 
 			const float zref = zref_offset + iout * FEEDBACK_RESISTOR;
 
-			// Amplifone nominal intensity range is approximately 1 V black to
-			// 4 V full intensity. Preserve Star Wars overdrive above 255, capped
-			// at twice nominal renderer intensity.
+			// The Amplifone monitor documentation specifies a nominal intensity
+			// range of 1 V black to 4 V full intensity. The Star Wars Z circuit
+			// can drive ZREF substantially above 4 V, so retain that analog
+			// overdrive in the extended renderer intensity range rather than
+			// clipping it at the monitor's nominal full-intensity point.
 			constexpr float MONITOR_BLACK_LEVEL = 1.0f;
 			constexpr float MONITOR_MAX_LEVEL = 4.0f;
 
 			return std::clamp(
 				int((zref - MONITOR_BLACK_LEVEL) *
-					(255.0f / (MONITOR_MAX_LEVEL - MONITOR_BLACK_LEVEL)) + 0.5f),
+					(160.0f / (MONITOR_MAX_LEVEL - MONITOR_BLACK_LEVEL)) + 0.5f),
 				0,
 				511);
 		}();
@@ -1176,47 +1177,6 @@ int avg_starwars_device::handler_7() // starwars_strobe3
 *  Quantum handler functions
 *
 *************************************/
-
-namespace {
-
-int quantum_z_intensity(u8 z)
-{
-	// Quantum schematic SP-221, sheet 8B.
-	// LS399 outputs drive a resistor DAC biased by R145/R144.
-	// Q12/Q13 approximately cancel their base-emitter offsets,
-	// so ZREF follows the DAC over most of the range.
-	//
-	// Amplifone operating range is approximately 1.0 V for black
-	// and 4.0 V for maximum intensity.
-
-	constexpr float VCC = 5.0f;
-	constexpr float MONITOR_BLACK_LEVEL = 1.0f;
-	constexpr float MONITOR_MAX_LEVEL = 4.0f;
-
-	constexpr float conductance =
-		1.0f / 3300.0f +
-		1.0f / 22000.0f +
-		1.0f / 1200.0f +
-		1.0f / 2200.0f +
-		1.0f / 4700.0f +
-		1.0f / 10000.0f;
-
-	const float zref =
-		(VCC / 3300.0f +
-		 BIT(z, 3) * VCC / 1200.0f +
-		 BIT(z, 2) * VCC / 2200.0f +
-		 BIT(z, 1) * VCC / 4700.0f +
-		 BIT(z, 0) * VCC / 10000.0f)
-		/ conductance;
-
-	return std::clamp(
-		int((zref - MONITOR_BLACK_LEVEL) *
-			(255.0f / (MONITOR_MAX_LEVEL - MONITOR_BLACK_LEVEL)) + 0.5f),
-		0,
-		255);
-}
-
-} // anonymous namespace
 
 void avg_quantum_device::update_databus() // quantum_data
 {
@@ -1374,6 +1334,41 @@ int avg_quantum_device::handler_7() // quantum_strobe3
 			// 1,Z1,1,Z0 (unused TTL inputs assumed HIGH).
 			return 0x0a | ((zfield & 0x02) << 1) | (zfield & 0x01);
 		}();
+		auto const quantum_z_intensity = [](u8 z)
+		{
+			// Quantum schematic SP-221, sheet 8B.
+			// LS399 outputs drive a resistor DAC biased by R145/R144.
+			// Q12/Q13 approximately cancel their base-emitter offsets,
+			// so ZREF follows the DAC over most of the range.
+			//
+			// The Amplifone monitor documentation specifies a nominal intensity
+			// range of 1 V black to 4 V full intensity.
+			constexpr float VCC = 5.0f;
+			constexpr float MONITOR_BLACK_LEVEL = 1.0f;
+			constexpr float MONITOR_MAX_LEVEL = 4.0f;
+
+			constexpr float conductance =
+				1.0f / 3300.0f +
+				1.0f / 22000.0f +
+				1.0f / 1200.0f +
+				1.0f / 2200.0f +
+				1.0f / 4700.0f +
+				1.0f / 10000.0f;
+
+			float const zref =
+				(VCC / 3300.0f +
+				 BIT(z, 3) * VCC / 1200.0f +
+				 BIT(z, 2) * VCC / 2200.0f +
+				 BIT(z, 1) * VCC / 4700.0f +
+				 BIT(z, 0) * VCC / 10000.0f)
+				/ conductance;
+
+			return std::clamp(
+				int((zref - MONITOR_BLACK_LEVEL) *
+					(255.0f / (MONITOR_MAX_LEVEL - MONITOR_BLACK_LEVEL)) + 0.5f),
+				0,
+				255);
+		};
 		int const intensity = quantum_z_intensity(z);
 		vg_add_point_buf(
 				y - m_ycenter + m_xcenter,

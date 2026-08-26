@@ -322,6 +322,7 @@ void starwars_state::starwars(machine_config &config)
 	vector_device &vector(VECTOR(config, "vector"));
 	vector.set_refresh_hz(CLOCK_3KHZ / 12 / 6);
 	vector.set_visarea(0, 250, 0, 280);
+	vector.set_intensity_range(511);
 
 	avg_device &avg(AVG_STARWARS(config, "avg"));
 	avg.set_vector("vector");

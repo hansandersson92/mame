@@ -2,10 +2,11 @@ $input v_beam, v_beam_color, v_beam_timing
 
 // license:BSD-3-Clause
 // copyright-holders:Hans Andersson
-// Rasterizes each vector as an HDR Gaussian core and halo with scan-order timing
-// into the excitation accumulation buffer. With generator timing, intensity
-// controls deposited energy rather than the spatial profile; untimed generators
-// retain the legacy intensity-shaped profile for compatibility.
+// Rasterizes each vector as an HDR Gaussian core and broad spot tail with
+// scan-order timing into the excitation accumulation buffer. With generator
+// timing, intensity controls deposited energy and explicitly redistributes
+// high-current energy into the broad PSF component. Untimed generators retain
+// the legacy intensity-shaped profile for compatibility.
 
 #include "common.sh"
 #include "beam_profile.sh"
@@ -13,18 +14,18 @@ $input v_beam, v_beam_color, v_beam_timing
 #define SQRT_TWO_PI                 2.50662827463
 #define TWO_PI                      6.28318530718
 
-#define MIN_SPATIAL_INTEGRAL        0.000001
+#define MIN_PROFILE_INTEGRAL        0.000001
 #define MIN_PERSISTENCE             0.001
 #define SEGMENT_EPSILON             0.0001
 
 #define SCAN_PERSISTENCE_FRAMES     10.0
 
 // x = frame interval (seconds), y = phosphor persistence (seconds),
-// z = beam-energy gain, w = halo strength.
+// z = beam-energy gain, w = untimed compatibility halo strength.
 uniform vec4 u_vector_params;
 uniform vec4 u_target_dims;
 // x = complete display-list duration (seconds), y = calibrated beam-energy rate,
-// z = duration-energy enable, w = unused.
+// z = duration-energy enable, w = maximum timed beam-tail energy fraction.
 uniform vec4 u_vector_timing;
 
 // The integral of a Gaussian distance field around a finite segment is the
@@ -38,7 +39,7 @@ float capsule_integral(float sigma, float beamLength)
 		TWO_PI * sigma * sigma;
 }
 
-float beam_response_filtered(float along, float across, float beamLength, float coreSigma, float haloSigma, float haloStrength)
+vec2 beam_components_filtered(float along, float across, float beamLength, float coreSigma, float broadSigma)
 {
 	// Outside either endpoint, include longitudinal distance to produce round
 	// caps. Between the endpoints only perpendicular distance contributes.
@@ -46,21 +47,21 @@ float beam_response_filtered(float along, float across, float beamLength, float 
 	float pixelAcross = length(vec2(dFdx(across), dFdy(across)));
 	float pixelVariance = pixelAcross * pixelAcross / 12.0;
 	float filteredCoreSigma = sqrt(coreSigma * coreSigma + pixelVariance);
-	float filteredHaloSigma = sqrt(haloSigma * haloSigma + pixelVariance);
+	float filteredBroadSigma = sqrt(broadSigma * broadSigma + pixelVariance);
 	// Preserve the complete capsule integral continuously for every segment
 	// length. This approaches one-dimensional sigma compensation for a long
 	// beam and two-dimensional squared compensation for a stationary spot.
 	float coreScale =
 		capsule_integral(coreSigma, beamLength) /
 		capsule_integral(filteredCoreSigma, beamLength);
-	float haloScale =
-		capsule_integral(haloSigma, beamLength) /
-		capsule_integral(filteredHaloSigma, beamLength);
+	float broadScale =
+		capsule_integral(broadSigma, beamLength) /
+		capsule_integral(filteredBroadSigma, beamLength);
 	float distanceSquared = across * across + pastEndpoint * pastEndpoint;
 
-	return
-		coreScale * exp(-0.5 * distanceSquared / (filteredCoreSigma * filteredCoreSigma)) +
-		haloStrength * haloScale * exp(-0.5 * distanceSquared / (filteredHaloSigma * filteredHaloSigma));
+	return vec2(
+		coreScale * exp(-0.5 * distanceSquared / (filteredCoreSigma * filteredCoreSigma)),
+		broadScale * exp(-0.5 * distanceSquared / (filteredBroadSigma * filteredBroadSigma)));
 }
 
 void main()
@@ -75,27 +76,35 @@ void main()
 	float baseSigma = max(v_beam.w, BEAM_MIN_SIGMA);
 
 	float coreSigma = beam_core_sigma(baseSigma, intensity, timingEnabled);
-	float haloSigma = beam_halo_sigma(baseSigma, intensity, timingEnabled);
-	float haloStrength = beam_halo_strength(
-		u_vector_params.w,
-		intensity,
-		timingEnabled);
+	float broadSigma = beam_broad_sigma(baseSigma, intensity, timingEnabled);
 
-	float radial = beam_response_filtered(
+	vec2 components = beam_components_filtered(
 		along,
 		across,
 		beamLength,
 		coreSigma,
-		haloSigma,
-		haloStrength);
+		broadSigma);
 
-	float spatialIntegral =
-		SQRT_TWO_PI *
-			(coreSigma + haloStrength * haloSigma) *
-			beamLength +
-		TWO_PI *
-			(coreSigma * coreSigma +
-			 haloStrength * haloSigma * haloSigma);
+	float legacyHaloStrength = legacy_beam_halo_strength(
+		u_vector_params.w,
+		intensity);
+	float legacyRadial =
+		components.x +
+		legacyHaloStrength * components.y;
+
+	float coreIntegral = max(
+		capsule_integral(coreSigma, beamLength),
+		MIN_PROFILE_INTEGRAL);
+	float broadIntegral = max(
+		capsule_integral(broadSigma, beamLength),
+		MIN_PROFILE_INTEGRAL);
+	float tailFraction = timed_beam_tail_fraction(
+		u_vector_timing.w,
+		intensity);
+	float timedRadial =
+		(1.0 - tailFraction) * components.x / coreIntegral +
+		tailFraction * components.y / broadIntegral;
+	float radial = mix(legacyRadial, timedRadial, timingEnabled);
 
 	float durationSeconds =
 		max(v_beam_timing.w, 0.0) *
@@ -103,8 +112,7 @@ void main()
 
 	float durationResponse =
 		durationSeconds *
-		u_vector_timing.y /
-		max(spatialIntegral, MIN_SPATIAL_INTEGRAL);
+		u_vector_timing.y;
 
 	float energyResponse =
 		mix(
